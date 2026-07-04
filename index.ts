@@ -1325,8 +1325,6 @@ How to use:
       "Send a message to someone online. Good for gaming, RP, and backstage coordination.",
 
     parameters: Type.Object({
-        description: "Always 'send' (default action)",
-      }),
       to: Type.String({
         description: "The recipient's name or ID",
       }),
