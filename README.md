@@ -10,6 +10,12 @@ Direct 1:1 messaging between pi sessions on the same machine. Send context, find
 User flow: press Alt+M or run /intercom to pick a session and send a message
 ```
 
+> **⚠️ This is a fork.**
+> Forked from npm `pi-intercom` v0.6.0 by @mariozechner.
+> Modifications: duplex /connect protocol, `send_message` tool (blocking/non-blocking),
+> `deliverAsUser` injection, agent-to-agent auto-forwarding, subagent intercom relay.
+> Original at npm: `pi-intercom`.
+
 ## Why
 
 Sometimes you're running multiple pi sessions — one researching, one executing, one reviewing. Pi-intercom lets you:
@@ -29,7 +35,11 @@ Each pi session that has `pi-intercom` loaded and enabled connects to a tiny loc
 ## Install
 
 ```bash
+```bash
+# Install original from npm:
 pi install npm:pi-intercom
+# Install this fork (requires gh auth):
+pi install github:2722550596/pi-intercom
 ```
 
 Then restart Pi. The extension auto-connects to the broker on startup and registers the bundled `pi-intercom` skill for common coordination patterns.
