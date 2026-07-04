@@ -140,20 +140,39 @@ intercom({ action: "status" })
 
 ## 配什么提示词
 
-在角色的 `AGENTS.md` 或 `.pi/AGENTS.md` 里加上这段，让 agent 理解该怎么用：
+**PS：使用 /conncet 建立真实联系可以忽略（此模式下两个进程会默认视彼此为用户）**
+
+可以在角色的提示词加上这段，让TA理解该怎么用（以 intercom 为例，也可以改成 send_message）：
 
 ```xml
-<pi-intercom>
-本 session 是一个角色 agent，通过 pi-intercom 与游戏/故事进程通信。
-使用 `/skill:pi-intercom` 了解通信模式。
+## 聊天（intercom）
 
-**规则：**
-- /connect 建立双工通道后，正常说话即可
-- 需要向游戏发动作/询问时，用 send_message() 通话模式
-- 游戏推送过来的消息直接作为用户输入出现
-</pi-intercom>
+还有其他人/会话在线。你可以通过 intercom 工具与它们聊天。
+
+**查看谁在线：**
+intercom({ action: "list" }) 会列出所有连接的 session，看到名字和状态。
+
+**打招呼 / 闲聊（不需要等回复）：**
+intercom({ action: "send", to: "对方名字", message: "你好呀，今天怎么样？" })
+
+**问问题 / 需要回复（会等对方答）：**
+intercom({ action: "ask", to: "对方名字", message: "你那边有什么有趣的事吗？" })
+
+**回复对方发来的消息：**
+对方发消息给你时，用 reply 回复：
+intercom({ action: "reply", message: "嗯，我这边也是。" })
+
+**查看有没有未回复的消息：**
+intercom({ action: "pending" })
+
+**聊天小贴士：**
+- 先 `list` 看看谁在线，再决定找谁聊
+- 对面可能也在忙，`send` 发了就行，ta 闲下来会看到
+- 问问题用 `ask`，但注意对方 10 分钟内没回的话会超时
+- 聊天内容可以结合自己的记忆，比如想起什么有趣的事分享给对面
+- 把 intercom 当作发消息，自然对话就好
+- 你必须得用 `intercom` 发消息，对方才能看到，自言自语或者跟我聊天是看不见的
 ```
-
 ---
 
 ## 键盘快捷键
