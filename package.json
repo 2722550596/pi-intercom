@@ -18,6 +18,7 @@
     "ui/**/*.ts",
     "skills/**/*"
   ],
+  "scripts": {
     "test": "tsx --test broker/paths.test.ts broker/spawn.test.ts"
   },
   "keywords": [
