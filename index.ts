@@ -911,29 +911,31 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "intercom",
     name: "intercom",
-    label: "会话工具",
-    description: `查看在线的人、发消息、聊天、问问题或者看看有没有人找过你。
-你可以给别人传话，但不像 send_message 那样自动注入成用户消息，这意味着别人会知道你不是用户。
+    label: "Intercom",
+    description: `See who's online, send messages, ask questions, or check if anyone's reached out to you.
 
-用法：
-  intercom({ action: "list" })                         → 看看谁在线
-  intercom({ action: "send", to: "对方名字", message: "..." })  → 发条消息过去
-  intercom({ action: "ask", to: "对方名字", message: "..." })   → 问个事，原地等回复
-  intercom({ action: "reply", message: "..." })                 → 回复刚才找你的那个人
-  intercom({ action: "pending" })                                 → 看看还有谁没回你
-  intercom({ action: "status" })                 → 看看通信连上没有`,
+You can pass messages to others, but unlike send_message, the recipient will know
+it's not you — the message arrives as a regular notification, not a user message.
+
+Usage:
+  intercom({ action: "list" })                         → See who's online
+  intercom({ action: "send", to: "name", message: "..." })  → Send a message
+  intercom({ action: "ask", to: "name", message: "..." })   → Ask and wait for reply
+  intercom({ action: "reply", message: "..." })              → Reply to the last person who messaged you
+  intercom({ action: "pending" })                            → Check who hasn't replied yet
+  intercom({ action: "status" })                 → Check connection status`,
     promptSnippet:
-      "查看在线列表、发消息、问问题或回复对方。适合后台通信，不如 send_message 自然。",
+      "List online peers, send messages, ask questions, or reply to someone. Good for back-channel communication — less natural than send_message.",
 
     parameters: Type.Object({
       action: Type.String({
-        description: "'list' 看谁在线，'send' 发消息，'ask' 问问题等回复，'reply' 回复对方，'pending' 看谁还没回你，'status' 看连接状态",
+        description: "'list' to see who's online, 'send' to send a message, 'ask' to ask and wait for reply, 'reply' to reply to someone, 'pending' to see who hasn't replied, 'status' to check connection",
       }),
       to: Type.Optional(Type.String({
-        description: "对方的会话名或ID（发消息/问问题时用，或者回复时用来区分谁是谁）",
+        description: "The recipient's session name or ID (for send/ask, or to disambiguate reply)",
       })),
       message: Type.Optional(Type.String({
-        description: "你想说的话（发消息、问问题、回复时填）",
+        description: "What you want to say (for send, ask, or reply)",
       })),
       attachments: Type.Optional(Type.Array(Type.Object({
         type: Type.Union([Type.Literal("file"), Type.Literal("snippet"), Type.Literal("context")]),
@@ -942,7 +944,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         language: Type.Optional(Type.String()),
       }))),
       replyTo: Type.Optional(Type.String({
-        description: "消息ID，用来回复某条特定的消息",
+        description: "Message ID to reply to a specific message",
       })),
     }),
 
@@ -1307,33 +1309,32 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "send_message",
-    label: "发消息", // 更加自然直观
-    description: `向另一个在线的人发送一条即时消息。
-  对方会像收到真正的用户留言一样立刻查看并处理。
-  你可以用它来呼叫默默流转的后勤伙伴、推动剧本杀/跑团里的GM剧情、或者联动其他角色的故事线。
+    label: "Send Message",
+    description: `Send an instant message to another online person. They'll see it
+and handle it just like a real user message — no notification, no "from intercom" label.
 
-  使用指南：
-    send_message({ to: "对方名字", message: "..." })          → 开启“通话模式”：发过去后，你会留在原地等对方把话完全说完。
-    send_message({ to: "对方名字", message: "...", blocking: false }) → 开启“留言模式”：消息发完你就去忙别的，对方稍后处理完了会弹窗提醒你。
+Use it to call a backstage helper, push a GM scene in a TTRPG, or trigger a
+character's story beat.
 
-  “通话模式（默认）”会让你原地等待对方处理完毕，并直接拿到他的最终回复。
-  “留言模式”则是已读不回（暂时），消息送达后你可以自由行动，对方的答复随后会以新消息的形式发给你。`
-    ,
+How to use:
+  send_message({ to: "name", message: "..." })
+    → "Call Mode": send and wait for their full reply
+  send_message({ to: "name", message: "...", blocking: false })
+    → "Leave-a-Message": fire and forget, reply arrives later`,
     promptSnippet:
-      "给另一个在线的人发送一条留言。适用于……打游戏？",
+      "Send a message to someone online. Good for gaming, RP, and backstage coordination.",
 
     parameters: Type.Object({
-      action: Type.Optional(Type.String({
-        description: "固定为 'send'（默认发信动作）",
-      })),
+        description: "Always 'send' (default action)",
+      }),
       to: Type.String({
-        description: "接收方的房间名或伙伴的名字（ID）",
+        description: "The recipient's name or ID",
       }),
       message: Type.String({
-        description: "你想对TA说的话",
+        description: "What you want to say",
       }),
       blocking: Type.Optional(Type.Boolean({
-        description: "是否留在原地等TA说完全部的话？默认为 true（是，在线等）；设置为 false 则为留言后去忙别的。",
+        description: "Whether to wait for their full reply. Default true (wait). Set to false to fire and forget.",
       })),
     }),
 
