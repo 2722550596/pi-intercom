@@ -1,0 +1,5 @@
+node_modules/
+*.log
+broker.pid
+broker.spawn.lock
+broker-launch.vbs
