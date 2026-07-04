@@ -26,7 +26,7 @@ const CONFIG_PATH = join(homedir(), ".pi/agent/intercom/config.json");
 
 const defaults: IntercomConfig = {
   brokerCommand: "npx",
-  brokerArgs: ["--no-install", "tsx"],
+  brokerArgs: ["tsx"],
   confirmSend: false,
   enabled: true,
   replyHint: true,
