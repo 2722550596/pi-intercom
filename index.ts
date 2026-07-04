@@ -910,29 +910,30 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "intercom",
-    label: "Intercom",
-    description: `Send a message to another session.
-Use this to communicate findings, request help, or coordinate work with other sessions.
+    name: "intercom",
+    label: "会话工具",
+    description: `查看在线的人、发消息、聊天、问问题或者看看有没有人找过你。
+你可以给别人传话，但不像 send_message 那样自动注入成用户消息，这意味着别人会知道你不是用户。
 
-Usage:
-  intercom({ action: "list" })                    → List active sessions
-  intercom({ action: "send", to: "session-name", message: "..." })  → Send message
-  intercom({ action: "ask", to: "session-name", message: "..." })   → Ask and wait for reply
-  intercom({ action: "reply", message: "..." })                      → Reply to the active/single pending ask
-  intercom({ action: "pending" })                                      → List unresolved inbound asks
-  intercom({ action: "status" })                  → Show connection status`,
+用法：
+  intercom({ action: "list" })                         → 看看谁在线
+  intercom({ action: "send", to: "对方名字", message: "..." })  → 发条消息过去
+  intercom({ action: "ask", to: "对方名字", message: "..." })   → 问个事，原地等回复
+  intercom({ action: "reply", message: "..." })                 → 回复刚才找你的那个人
+  intercom({ action: "pending" })                                 → 看看还有谁没回你
+  intercom({ action: "status" })                 → 看看通信连上没有`,
     promptSnippet:
-      "Use to coordinate with other local sessions: list peers, send updates, ask for help, or check intercom connectivity.",
+      "查看在线列表、发消息、问问题或回复对方。适合后台通信，不如 send_message 自然。",
 
     parameters: Type.Object({
       action: Type.String({
-        description: "Action: 'list', 'send', 'ask', 'reply', 'pending', or 'status'",
+        description: "'list' 看谁在线，'send' 发消息，'ask' 问问题等回复，'reply' 回复对方，'pending' 看谁还没回你，'status' 看连接状态",
       }),
       to: Type.Optional(Type.String({
-        description: "Target session name or ID (for 'send', 'ask', or disambiguating 'reply')",
+        description: "对方的会话名或ID（发消息/问问题时用，或者回复时用来区分谁是谁）",
       })),
       message: Type.Optional(Type.String({
-        description: "Message to send (for 'send', 'ask', or 'reply' action)",
+        description: "你想说的话（发消息、问问题、回复时填）",
       })),
       attachments: Type.Optional(Type.Array(Type.Object({
         type: Type.Union([Type.Literal("file"), Type.Literal("snippet"), Type.Literal("context")]),
@@ -941,7 +942,7 @@ Usage:
         language: Type.Optional(Type.String()),
       }))),
       replyTo: Type.Optional(Type.String({
-        description: "Message ID to reply to (for threading or responding to an 'ask')",
+        description: "消息ID，用来回复某条特定的消息",
       })),
     }),
 
