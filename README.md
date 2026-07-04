@@ -1,6 +1,4 @@
-<p>
-  <img src="banner.png" alt="pi-intercom" width="1100">
-</p>
+[English](README.md) | [中文](README.zh.md)
 
 # Pi Intercom — RP Fork
 
