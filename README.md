@@ -16,7 +16,7 @@ Key differences from upstream:
 User flow: /connect <character-name> → talk naturally → replies flow automatically
 ```
 
-> Original at npm: `pi-intercom` v0.6.0 by @mariozechner.
+> Original at npm: `pi-intercom` v0.6.0 by [nicopreme](https://www.npmjs.com/~nicopreme) ([@nicobailon](https://github.com/nicobailon)). Original repository: https://github.com/nicobailon/pi-intercom
 
 ## Why (RP Use Case)
 
@@ -46,7 +46,7 @@ Each pi session that has `pi-intercom` loaded and enabled connects to a tiny loc
 # Install original from npm:
 pi install npm:pi-intercom
 # Install this fork (requires gh auth):
-pi install github:2722550596/pi-intercom
+pi install git:github.com/2722550596/pi-intercom
 ```
 
 Then restart Pi. The extension auto-connects to the broker on startup and registers the bundled `pi-intercom` skill for common coordination patterns.

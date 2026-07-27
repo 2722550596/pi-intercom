@@ -3,7 +3,7 @@
 # Pi Intercom — RP Fork
 
 > **⚠️ 这是魔改 fork 版。**
-> 上游版本：npm `pi-intercom` v0.6.0 by @mariozechner。
+> 上游版本：npm `pi-intercom` v0.6.0 by [nicopreme](https://www.npmjs.com/~nicopreme) ([@nicobailon](https://github.com/nicobailon))。原仓库：https://github.com/nicobailon/pi-intercom
 >
 > 本 fork 专为**角色扮演（RP）场景**设计：
 > 一个终端跑角色 agent，另一个终端跑游戏/故事进程，让它们自然交流。
@@ -39,7 +39,7 @@
 
 ```bash
 # 安装本 fork（需要 GitHub 认证）
-pi install github:2722550596/pi-intercom
+pi install git:github.com/2722550596/pi-intercom
 
 # 或从 npm 安装上游原版
 pi install npm:pi-intercom
