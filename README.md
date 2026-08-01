@@ -133,6 +133,53 @@ See auth.ts:142-156.
 
 The reply hint (enabled by default) points to `intercom({ action: "reply", ... })`, so recipients do not need raw sender or `replyTo` IDs. Idle recipients get a new turn immediately; busy interactive recipients receive the message once they go idle. Attachment content is included in the agent-visible body, and messages are rendered inline and stored in Pi session history.
 
+## Workflow: Broadcast / Listen (One-Way Channels)
+
+For scenarios where you want asymmetric communication — one session broadcasting
+output to one or more listeners without automatic replies:
+
+- `/cast <name>` — broadcast your output to another session. Your messages arrive
+  as intercom notifications (with sender info), so listeners can distinguish
+  multiple casters.
+- `/listen <name>` — receive another session's broadcast. You see their output as
+  intercom messages, and can reply via `intercom` or `send_message` tools.
+
+### Use Cases
+
+- **GM broadcasting to multiple characters** — the GM session casts to all player
+  character sessions. Each character receives world events as notifications and
+  can respond individually.
+- **Observer monitoring** — a session listens to a game session's output without
+  injecting messages back.
+- **Logging/aggregation** — a central session listens to multiple workers and
+  aggregates their output.
+
+### Setup
+
+```
+# Terminal 1 (caster)                # Terminal 2 (listener)
+/name gm                             /name player1
+
+/cast player1                        /listen gm
+# or equivalently:
+# (player1 runs /listen gm instead)
+```
+
+Now:
+
+- **Caster says something** → lands as an intercom notification in all listeners
+- **Listener wants to reply** → must use `intercom` or `send_message` tools
+- **One caster, many listeners** — cast to multiple sessions
+- **One listener, many casters** — listen to multiple sessions
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `/cast <name>` | Start broadcasting to a session |
+| `/stopcast [name]` | Stop broadcasting (to specific session or all) |
+| `/listen <name>` | Start listening to a session |
+| `/unlisten [name]` | Stop listening (to specific session or all) |
 ## Workflow: Character ↔ Game (Duplex)
 
 The most natural RP setup: connect a character agent to a game/story process via

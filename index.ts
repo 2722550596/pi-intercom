@@ -20,6 +20,11 @@ const DEFAULT_UNNAMED_SESSION_ALIAS_PREFIX = "subagent-chat";
 /** Connect/disconnect signalling prefixes – intercepted in handleIncomingMessage and silently consumed. */
 const CONNECT_PREFIX = "🔗/connect:";
 const DISCONNECT_PREFIX = "🔗/disconnect:";
+/** Cast/listen signalling prefixes – asymmetric forwarding. */
+const CAST_PREFIX = "📡/cast:";
+const LISTEN_PREFIX = "📻/listen:";
+const UNLISTEN_PREFIX = "📻/unlisten:";
+const STOPCAST_PREFIX = "📡/stopcast:";
 interface InboundMessageEntry {
   from: SessionInfo;
   message: Message;
@@ -141,6 +146,13 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   /** Pending duplex forward waiting for rendered-prose content (two-pass renderer). */
   let pendingDuplexForward: { peerId: string } | null = null;
 
+  /** Cast/listen: sessions I'm broadcasting my output to (I'm the caster). */
+  const listeners = new Map<string, { id: string; name: string }>();
+  /** Cast/listen: sessions casting their output to me (I'm the listener). */
+  const casterIds = new Set<string>();
+  /** Listener IDs waiting for rendered-prose delivery (two-pass renderer fallback). */
+  const pendingCastListenerIds = new Set<string>();
+
   /** Global hook for two-pass renderers to deliver fsn-prose content (e.g., fate-sandbox). */
   function onProseReady(text: string): void {
     // Handle pendingUserMessageResults (existing send_message reply tracking)
@@ -164,12 +176,28 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       if (activeClient?.isConnected()) {
         activeClient.send(peerId, {
           text,
-          deliverAsUser: true,
+          deliverAsUser: false,
           expectsReply: false,
         }).catch(() => {
           // Best-effort
         });
       }
+    }
+    // Handle pending cast forward (rendered-prose output for all listeners)
+    if (pendingCastListenerIds.size > 0) {
+      const activeClient = client;
+      if (activeClient?.isConnected()) {
+        for (const listenerId of pendingCastListenerIds) {
+          activeClient.send(listenerId, {
+            text,
+            deliverAsUser: false,
+            expectsReply: false,
+          }).catch(() => {
+            // Best-effort
+          });
+        }
+      }
+      pendingCastListenerIds.clear();
     }
   }
 
@@ -382,7 +410,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     scheduleInboundFlush();
   }
   /**
-   * Intercept a duplex protocol message (connect/disconnect) and update local state.
+   * Intercept a protocol message (connect/disconnect/cast/listen) and update local state.
    * Returns true if the message was consumed, false otherwise.
    */
   function handleDuplexProtocolMessage(from: SessionInfo, message: Message): boolean {
@@ -403,6 +431,34 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         connectedPeer = null;
         notifyIfLive(runtimeContext!, `🔗 Duplex disconnected from "${peerName}".`, "info");
       }
+      return true;
+    }
+    // Cast: someone is casting their output to me (I become a listener)
+    if (text.startsWith(CAST_PREFIX)) {
+      const casterName = text.slice(CAST_PREFIX.length).trim();
+      casterIds.add(from.id);
+      notifyIfLive(runtimeContext!, `📻 "${casterName || from.name || from.id.slice(0, 8)}" is now casting to you. Their output will flow automatically.`, "info");
+      return true;
+    }
+    // Stopcast: someone stopped casting to me
+    if (text.startsWith(STOPCAST_PREFIX)) {
+      const casterName = text.slice(STOPCAST_PREFIX.length).trim();
+      casterIds.delete(from.id);
+      notifyIfLive(runtimeContext!, `📻 "${casterName || from.name || from.id.slice(0, 8)}" stopped casting to you.`, "info");
+      return true;
+    }
+    // Listen: someone wants to listen to my output (I become a caster)
+    if (text.startsWith(LISTEN_PREFIX)) {
+      const listenerName = text.slice(LISTEN_PREFIX.length).trim();
+      listeners.set(from.id, { id: from.id, name: from.name || listenerName });
+      notifyIfLive(runtimeContext!, `📡 "${listenerName || from.name || from.id.slice(0, 8)}" is now listening to your output.`, "info");
+      return true;
+    }
+    // Unlisten: someone stopped listening to me
+    if (text.startsWith(UNLISTEN_PREFIX)) {
+      const listenerName = text.slice(UNLISTEN_PREFIX.length).trim();
+      listeners.delete(from.id);
+      notifyIfLive(runtimeContext!, `📡 "${listenerName || from.name || from.id.slice(0, 8)}" stopped listening.`, "info");
       return true;
     }
     return false;
@@ -504,6 +560,16 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     nextClient.on("session_left", (sessionId: string) => {
       if (connectedPeer && connectedPeer.id === sessionId) {
         clearConnectedPeer();
+      }
+      // Clean up cast/listen relationships
+      if (listeners.has(sessionId)) {
+        const listenerName = listeners.get(sessionId)?.name || sessionId.slice(0, 8);
+        listeners.delete(sessionId);
+        notifyIfLive(runtimeContext!, `📡 Listener "${listenerName}" disconnected.`, "warning");
+      }
+      if (casterIds.has(sessionId)) {
+        casterIds.delete(sessionId);
+        notifyIfLive(runtimeContext!, `📻 Caster "${sessionId.slice(0, 8)}" disconnected.`, "warning");
       }
     });
     nextClient.on("disconnected", (error: Error) => {
@@ -838,6 +904,42 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         pendingDuplexForward = { peerId: connectedPeer.id };
       }
     }
+    // Forward last output to all cast listeners (asymmetric one-way forwarding)
+    if (listeners.size > 0 && client?.isConnected()) {
+      let castForwardText: string | null = null;
+      const messages = event.messages;
+      if (messages && messages.length > 0) {
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const msg = messages[i];
+          if (msg.role === "assistant" && msg.content) {
+            for (const part of msg.content) {
+              if (part.type === "text" && typeof (part as any).text === "string") {
+                castForwardText = (part as any).text;
+                break;
+              }
+            }
+            if (castForwardText) break;
+          }
+        }
+      }
+      if (castForwardText) {
+        for (const [listenerId] of listeners) {
+          client.send(listenerId, {
+            text: castForwardText,
+            deliverAsUser: false,
+            expectsReply: false,
+          }).catch(() => {
+            // Best-effort; listeners will catch up on next turn
+          });
+        }
+      } else {
+        // No assistant text found — rendered-prose may deliver later
+        for (const [listenerId] of listeners) {
+          pendingCastListenerIds.add(listenerId);
+        }
+      }
+    }
+
 
 
     // Send results back for completed deliverAsUser messages
@@ -1660,9 +1762,193 @@ How to use:
     },
   });
 
+  pi.registerCommand("cast", {
+    description: "Start casting your output to another session (one-way)",
+    handler: async (args, ctx) => {
+      const targetName = (typeof args === "string" ? args : "").trim();
+      if (!targetName) {
+        if (ctx.hasUI) ctx.ui.notify("Usage: /cast <session name>", "warning");
+        return;
+      }
+      let activeClient: IntercomClient;
+      try {
+        activeClient = await ensureConnected("tool");
+      } catch (error) {
+        if (ctx.hasUI) ctx.ui.notify(`Intercom not connected: ${getErrorMessage(error)}`, "error");
+        return;
+      }
+      if (activeClient.sessionId === null) {
+        if (ctx.hasUI) ctx.ui.notify("No session ID yet.", "error");
+        return;
+      }
+      const targetId = await resolveSessionTarget(activeClient, targetName) ?? null;
+      if (!targetId) {
+        if (ctx.hasUI) ctx.ui.notify(`Session "${targetName}" not found. Use /intercom to list sessions.`, "error");
+        return;
+      }
+      if (targetId === activeClient.sessionId) {
+        if (ctx.hasUI) ctx.ui.notify("Cannot cast to yourself.", "warning");
+        return;
+      }
+      if (listeners.has(targetId)) {
+        if (ctx.hasUI) ctx.ui.notify(`Already casting to "${targetName}".`, "warning");
+        return;
+      }
+      const myName = buildPresenceIdentity(pi, activeClient.sessionId).name;
+      const requestResult = await activeClient.send(targetId, {
+        text: `${CAST_PREFIX}${myName}`,
+        deliverAsUser: false,
+        expectsReply: false,
+      });
+      if (!requestResult.delivered) {
+        const reason = requestResult.reason ?? "Delivery failed.";
+        if (ctx.hasUI) ctx.ui.notify(`Cast request not delivered: ${reason}`, "error");
+        return;
+      }
+      listeners.set(targetId, { id: targetId, name: targetName });
+      if (ctx.hasUI) {
+        ctx.ui.notify(`📡 Now casting your output to "${targetName}". Your replies will flow automatically.`, "info");
+      }
+    },
+  });
+
+  pi.registerCommand("listen", {
+    description: "Start listening to another session's output (one-way)",
+    handler: async (args, ctx) => {
+      const targetName = (typeof args === "string" ? args : "").trim();
+      if (!targetName) {
+        if (ctx.hasUI) ctx.ui.notify("Usage: /listen <session name>", "warning");
+        return;
+      }
+      let activeClient: IntercomClient;
+      try {
+        activeClient = await ensureConnected("tool");
+      } catch (error) {
+        if (ctx.hasUI) ctx.ui.notify(`Intercom not connected: ${getErrorMessage(error)}`, "error");
+        return;
+      }
+      if (activeClient.sessionId === null) {
+        if (ctx.hasUI) ctx.ui.notify("No session ID yet.", "error");
+        return;
+      }
+      const targetId = await resolveSessionTarget(activeClient, targetName) ?? null;
+      if (!targetId) {
+        if (ctx.hasUI) ctx.ui.notify(`Session "${targetName}" not found. Use /intercom to list sessions.`, "error");
+        return;
+      }
+      if (targetId === activeClient.sessionId) {
+        if (ctx.hasUI) ctx.ui.notify("Cannot listen to yourself.", "warning");
+        return;
+      }
+      if (casterIds.has(targetId)) {
+        if (ctx.hasUI) ctx.ui.notify(`Already listening to "${targetName}".`, "warning");
+        return;
+      }
+      const myName = buildPresenceIdentity(pi, activeClient.sessionId).name;
+      const requestResult = await activeClient.send(targetId, {
+        text: `${LISTEN_PREFIX}${myName}`,
+        deliverAsUser: false,
+        expectsReply: false,
+      });
+      if (!requestResult.delivered) {
+        const reason = requestResult.reason ?? "Delivery failed.";
+        if (ctx.hasUI) ctx.ui.notify(`Listen request not delivered: ${reason}`, "error");
+        return;
+      }
+      casterIds.add(targetId);
+      if (ctx.hasUI) {
+        ctx.ui.notify(`📻 Now listening to "${targetName}". Their output will flow to you automatically.`, "info");
+      }
+    },
+  });
+
+  pi.registerCommand("stopcast", {
+    description: "Stop casting to a specific listener, or all listeners if no name given",
+    handler: async (args, ctx) => {
+      const targetName = (typeof args === "string" ? args : "").trim();
+      if (listeners.size === 0) {
+        if (ctx.hasUI) ctx.ui.notify("Not casting to anyone.", "warning");
+        return;
+      }
+      const activeClient = client;
+      if (!activeClient?.isConnected()) {
+        if (ctx.hasUI) ctx.ui.notify("Intercom not connected.", "error");
+        return;
+      }
+      const myName = buildPresenceIdentity(pi, activeClient.sessionId!).name;
+      if (targetName) {
+        const targetId = await resolveSessionTarget(activeClient, targetName) ?? null;
+        if (!targetId || !listeners.has(targetId)) {
+          if (ctx.hasUI) ctx.ui.notify(`Not casting to "${targetName}".`, "warning");
+          return;
+        }
+        await activeClient.send(targetId, {
+          text: `${STOPCAST_PREFIX}${myName}`,
+          deliverAsUser: false,
+          expectsReply: false,
+        });
+        listeners.delete(targetId);
+        if (ctx.hasUI) ctx.ui.notify(`📡 Stopped casting to "${targetName}".`, "info");
+      } else {
+        for (const [listenerId] of listeners) {
+          await activeClient.send(listenerId, {
+            text: `${STOPCAST_PREFIX}${myName}`,
+            deliverAsUser: false,
+            expectsReply: false,
+          });
+        }
+        const count = listeners.size;
+        listeners.clear();
+        if (ctx.hasUI) ctx.ui.notify(`📡 Stopped casting to ${count} listener${count > 1 ? 's' : ''}.`, "info");
+      }
+    },
+  });
+
+  pi.registerCommand("unlisten", {
+    description: "Stop listening to a specific caster, or all casters if no name given",
+    handler: async (args, ctx) => {
+      const targetName = (typeof args === "string" ? args : "").trim();
+      if (casterIds.size === 0) {
+        if (ctx.hasUI) ctx.ui.notify("Not listening to anyone.", "warning");
+        return;
+      }
+      const activeClient = client;
+      if (!activeClient?.isConnected()) {
+        if (ctx.hasUI) ctx.ui.notify("Intercom not connected.", "error");
+        return;
+      }
+      const myName = buildPresenceIdentity(pi, activeClient.sessionId!).name;
+      if (targetName) {
+        const targetId = await resolveSessionTarget(activeClient, targetName) ?? null;
+        if (!targetId || !casterIds.has(targetId)) {
+          if (ctx.hasUI) ctx.ui.notify(`Not listening to "${targetName}".`, "warning");
+          return;
+        }
+        await activeClient.send(targetId, {
+          text: `${UNLISTEN_PREFIX}${myName}`,
+          deliverAsUser: false,
+          expectsReply: false,
+        });
+        casterIds.delete(targetId);
+        if (ctx.hasUI) ctx.ui.notify(`📻 Stopped listening to "${targetName}".`, "info");
+      } else {
+        for (const casterId of casterIds) {
+          await activeClient.send(casterId, {
+            text: `${UNLISTEN_PREFIX}${myName}`,
+            deliverAsUser: false,
+            expectsReply: false,
+          });
+        }
+        const count = casterIds.size;
+        casterIds.clear();
+        if (ctx.hasUI) ctx.ui.notify(`📻 Stopped listening to ${count} caster${count > 1 ? 's' : ''}.`, "info");
+      }
+    },
+  });
+
   // ── Legacy overlay commands ──
   pi.registerCommand("intercom", {
-    description: "List sessions (use /connect <name> for duplex)",
+    description: "List sessions (use /connect for duplex, /cast or /listen for one-way)",
     handler: async (_args, ctx) => openIntercomOverlay(ctx),
   });
 
