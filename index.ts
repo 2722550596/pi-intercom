@@ -1017,7 +1017,10 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       }
 
       const pending = pendingUserMessageResults.shift()!;
-      if (lastAssistantText) {
+      // Skip reply if the target is also a cast listener — the cast-forward above
+      // already delivers the same output, and the duplicate message would bypass
+      // the background queue (arriving as a plain notification instead).
+      if (lastAssistantText && !listeners.has(pending.from.id)) {
         const activeClient = client;
         if (activeClient?.isConnected()) {
           activeClient.send(pending.from.id, {
@@ -1027,11 +1030,12 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
             // Best-effort result delivery
           });
         }
-      } else {
+      } else if (!lastAssistantText) {
         // No assistant text found (e.g., two-pass renderer will deliver fsn-prose via global hook later).
         // Re-queue the pending entry for prose-ready hook capture.
         pendingUserMessageResults.unshift(pending);
       }
+      // If lastAssistantText exists AND target is a cast listener: no-op (cast forward covers it)
     }
   });
 
