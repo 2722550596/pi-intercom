@@ -1481,9 +1481,10 @@ How to use:
       "Send a message to someone online. Good for gaming, RP, and backstage coordination.",
 
     parameters: Type.Object({
-      action: Type.String({
-        description: "Always 'send' (default action)",
-      }),
+      action: Type.Optional(Type.String({
+        default: "send",
+        description: "Action type — defaults to 'send'. Leave empty for normal message sending.",
+      })),
       to: Type.String({
         description: "The recipient's name or ID",
       }),
