@@ -13,6 +13,8 @@ interface SendOptions {
   replyTo?: string;
   expectsReply?: boolean;
   deliverAsUser?: boolean;
+  /** If true, write to background JSON instead of triggering a turn */
+  background?: boolean;
   messageId?: string;
 }
 
@@ -485,7 +487,6 @@ export class IntercomClient extends EventEmitter {
     } catch (error) {
       return Promise.reject(toError(error));
     }
-    
     const messageId = options.messageId ?? randomUUID();
     const message: Message = {
       id: messageId,
@@ -493,6 +494,7 @@ export class IntercomClient extends EventEmitter {
       replyTo: options.replyTo,
       expectsReply: options.expectsReply,
       deliverAsUser: options.deliverAsUser,
+      background: options.background,
       content: {
         text: options.text,
         attachments: options.attachments,
