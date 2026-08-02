@@ -1,3 +1,5 @@
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { join } from "path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "crypto";
 import { Type } from "typebox";
@@ -21,10 +23,13 @@ const DEFAULT_UNNAMED_SESSION_ALIAS_PREFIX = "subagent-chat";
 const CONNECT_PREFIX = "🔗/connect:";
 const DISCONNECT_PREFIX = "🔗/disconnect:";
 /** Cast/listen signalling prefixes – asymmetric forwarding. */
+const LISTEN_BG_PREFIX = "📡/listen-bg:";
 const CAST_PREFIX = "📡/cast:";
+const CAST_BG_PREFIX = "📡/cast-bg:";
 const LISTEN_PREFIX = "📻/listen:";
 const UNLISTEN_PREFIX = "📻/unlisten:";
 const STOPCAST_PREFIX = "📡/stopcast:";
+
 interface InboundMessageEntry {
   from: SessionInfo;
   message: Message;
@@ -146,12 +151,15 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   /** Pending duplex forward waiting for rendered-prose content (two-pass renderer). */
   let pendingDuplexForward: { peerId: string } | null = null;
 
-  /** Cast/listen: sessions I'm broadcasting my output to (I'm the caster). */
-  const listeners = new Map<string, { id: string; name: string }>();
+  /** Cast/listen: sessions I'm broadcasting my output to (I'm the caster). background = write to JSON, no turn. */
+  const listeners = new Map<string, { id: string; name: string; background: boolean }>();
   /** Cast/listen: sessions casting their output to me (I'm the listener). */
   const casterIds = new Set<string>();
+  /** Casters sending in background mode (their messages write to JSON, no turn). */
+  const backgroundCasterIds = new Set<string>();
   /** Listener IDs waiting for rendered-prose delivery (two-pass renderer fallback). */
   const pendingCastListenerIds = new Set<string>();
+
 
   /** Global hook for two-pass renderers to deliver fsn-prose content (e.g., fate-sandbox). */
   function onProseReady(text: string): void {
@@ -188,9 +196,11 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       const activeClient = client;
       if (activeClient?.isConnected()) {
         for (const listenerId of pendingCastListenerIds) {
+          const listener = listeners.get(listenerId);
           activeClient.send(listenerId, {
             text,
             deliverAsUser: false,
+            background: listener?.background ?? false,
             expectsReply: false,
           }).catch(() => {
             // Best-effort
@@ -434,12 +444,21 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       return true;
     }
     // Cast: someone is casting their output to me (I become a listener)
-    if (text.startsWith(CAST_PREFIX)) {
-      const casterName = text.slice(CAST_PREFIX.length).trim();
+    if (text.startsWith(CAST_PREFIX) || text.startsWith(CAST_BG_PREFIX)) {
+      const isBackground = text.startsWith(CAST_BG_PREFIX);
+      const prefix = isBackground ? CAST_BG_PREFIX : CAST_PREFIX;
+      const casterName = text.slice(prefix.length).trim();
       casterIds.add(from.id);
-      notifyIfLive(runtimeContext!, `📻 "${casterName || from.name || from.id.slice(0, 8)}" is now casting to you. Their output will flow automatically.`, "info");
+      if (isBackground) {
+        backgroundCasterIds.add(from.id);
+        notifyIfLive(runtimeContext!, `📻 "${casterName || from.name || from.id.slice(0, 8)}" is now casting to you (background mode). Their output will be queued, no auto-turn.`, "info");
+      } else {
+        backgroundCasterIds.delete(from.id);
+        notifyIfLive(runtimeContext!, `📻 "${casterName || from.name || from.id.slice(0, 8)}" is now casting to you. Their output will flow automatically.`, "info");
+      }
       return true;
     }
+
     // Stopcast: someone stopped casting to me
     if (text.startsWith(STOPCAST_PREFIX)) {
       const casterName = text.slice(STOPCAST_PREFIX.length).trim();
@@ -447,11 +466,14 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       notifyIfLive(runtimeContext!, `📻 "${casterName || from.name || from.id.slice(0, 8)}" stopped casting to you.`, "info");
       return true;
     }
-    // Listen: someone wants to listen to my output (I become a caster)
-    if (text.startsWith(LISTEN_PREFIX)) {
-      const listenerName = text.slice(LISTEN_PREFIX.length).trim();
-      listeners.set(from.id, { id: from.id, name: from.name || listenerName });
-      notifyIfLive(runtimeContext!, `📡 "${listenerName || from.name || from.id.slice(0, 8)}" is now listening to your output.`, "info");
+    // Listen: someone wants to listen to me (I become caster)
+    if (text.startsWith(LISTEN_PREFIX) || text.startsWith(LISTEN_BG_PREFIX)) {
+      const isBackground = text.startsWith(LISTEN_BG_PREFIX);
+      const prefix = isBackground ? LISTEN_BG_PREFIX : LISTEN_PREFIX;
+      const listenerName = text.slice(prefix.length).trim();
+      listeners.set(from.id, { id: from.id, name: from.name || listenerName, background: isBackground });
+      const mode = isBackground ? " (background mode)" : "";
+      notifyIfLive(runtimeContext!, `📡 "${listenerName || from.name || from.id.slice(0, 8)}" is now listening to your output${mode}.`, "info");
       return true;
     }
     // Unlisten: someone stopped listening to me
@@ -508,6 +530,36 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       pi.sendUserMessage(message.content.text);
       return;
     }
+    // Background message → write to JSON queue, do not trigger turn
+    if (message.background) {
+      try {
+        const homeDir = process.env.HOME || process.env.USERPROFILE || "/tmp";
+        const queueDir = join(homeDir, ".pi", "agent", "intercom");
+        mkdirSync(queueDir, { recursive: true });
+        const queueFile = join(queueDir, "background-queue.json");
+        
+        let queue: Array<{ from: { id: string; name: string }; text: string; timestamp: number }> = [];
+        if (existsSync(queueFile)) {
+          try {
+            queue = JSON.parse(readFileSync(queueFile, "utf-8"));
+          } catch {
+            queue = [];
+          }
+        }
+        
+        queue.push({
+          from: { id: from.id, name: from.name || from.id.slice(0, 8) },
+          text: message.content.text,
+          timestamp: Date.now()
+        });
+        
+        writeFileSync(queueFile, JSON.stringify(queue, null, 2));
+      } catch (err) {
+        console.error("Failed to write background message:", err);
+      }
+      return;
+    }
+
 
     const attachmentText = message.content.attachments?.length
       ? formatAttachments(message.content.attachments)
@@ -569,6 +621,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       }
       if (casterIds.has(sessionId)) {
         casterIds.delete(sessionId);
+        backgroundCasterIds.delete(sessionId);
         notifyIfLive(runtimeContext!, `📻 Caster "${sessionId.slice(0, 8)}" disconnected.`, "warning");
       }
     });
@@ -923,10 +976,11 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         }
       }
       if (castForwardText) {
-        for (const [listenerId] of listeners) {
+        for (const [listenerId, listener] of listeners) {
           client.send(listenerId, {
             text: castForwardText,
             deliverAsUser: false,
+            background: listener.background,
             expectsReply: false,
           }).catch(() => {
             // Best-effort; listeners will catch up on next turn
@@ -1763,11 +1817,13 @@ How to use:
   });
 
   pi.registerCommand("cast", {
-    description: "Start casting your output to another session (one-way)",
+    description: "Start casting your output to another session (one-way). Use --background for queued mode.",
     handler: async (args, ctx) => {
-      const targetName = (typeof args === "string" ? args : "").trim();
+      const argsStr = (typeof args === "string" ? args : "").trim();
+      const background = argsStr.includes("--background");
+      const targetName = argsStr.replace("--background", "").trim();
       if (!targetName) {
-        if (ctx.hasUI) ctx.ui.notify("Usage: /cast <session name>", "warning");
+        if (ctx.hasUI) ctx.ui.notify("Usage: /cast <session name> [--background]", "warning");
         return;
       }
       let activeClient: IntercomClient;
@@ -1795,8 +1851,9 @@ How to use:
         return;
       }
       const myName = buildPresenceIdentity(pi, activeClient.sessionId).name;
+      const prefix = background ? CAST_BG_PREFIX : CAST_PREFIX;
       const requestResult = await activeClient.send(targetId, {
-        text: `${CAST_PREFIX}${myName}`,
+        text: `${prefix}${myName}`,
         deliverAsUser: false,
         expectsReply: false,
       });
@@ -1805,19 +1862,22 @@ How to use:
         if (ctx.hasUI) ctx.ui.notify(`Cast request not delivered: ${reason}`, "error");
         return;
       }
-      listeners.set(targetId, { id: targetId, name: targetName });
+      listeners.set(targetId, { id: targetId, name: targetName, background });
       if (ctx.hasUI) {
-        ctx.ui.notify(`📡 Now casting your output to "${targetName}". Your replies will flow automatically.`, "info");
+        const mode = background ? " (background mode - queued)" : "";
+        ctx.ui.notify(`📡 Now casting your output to "${targetName}"${mode}. Your replies will flow automatically.`, "info");
       }
     },
   });
 
   pi.registerCommand("listen", {
-    description: "Start listening to another session's output (one-way)",
+    description: "Start listening to another session's output (one-way). Use --background for queued mode.",
     handler: async (args, ctx) => {
-      const targetName = (typeof args === "string" ? args : "").trim();
+      const argsStr = (typeof args === "string" ? args : "").trim();
+      const background = argsStr.includes("--background");
+      const targetName = argsStr.replace("--background", "").trim();
       if (!targetName) {
-        if (ctx.hasUI) ctx.ui.notify("Usage: /listen <session name>", "warning");
+        if (ctx.hasUI) ctx.ui.notify("Usage: /listen <session name> [--background]", "warning");
         return;
       }
       let activeClient: IntercomClient;
@@ -1845,8 +1905,9 @@ How to use:
         return;
       }
       const myName = buildPresenceIdentity(pi, activeClient.sessionId).name;
+      const prefix = background ? LISTEN_BG_PREFIX : LISTEN_PREFIX;
       const requestResult = await activeClient.send(targetId, {
-        text: `${LISTEN_PREFIX}${myName}`,
+        text: `${prefix}${myName}`,
         deliverAsUser: false,
         expectsReply: false,
       });
@@ -1856,8 +1917,12 @@ How to use:
         return;
       }
       casterIds.add(targetId);
+      if (background) {
+        backgroundCasterIds.add(targetId);
+      }
       if (ctx.hasUI) {
-        ctx.ui.notify(`📻 Now listening to "${targetName}". Their output will flow to you automatically.`, "info");
+        const mode = background ? " (background mode - queued)" : "";
+        ctx.ui.notify(`📻 Now listening to "${targetName}"${mode}. Their output will flow to you automatically.`, "info");
       }
     },
   });
@@ -1887,8 +1952,9 @@ How to use:
           deliverAsUser: false,
           expectsReply: false,
         });
+        const wasBg = listeners.get(targetId)?.background ?? false;
         listeners.delete(targetId);
-        if (ctx.hasUI) ctx.ui.notify(`📡 Stopped casting to "${targetName}".`, "info");
+        if (ctx.hasUI) ctx.ui.notify(`📡 Stopped casting to "${targetName}"${wasBg ? " (was background)" : ""}.`, "info");
       } else {
         for (const [listenerId] of listeners) {
           await activeClient.send(listenerId, {
@@ -1898,8 +1964,10 @@ How to use:
           });
         }
         const count = listeners.size;
+        const bgCount = Array.from(listeners.values()).filter(l => l.background).length;
         listeners.clear();
-        if (ctx.hasUI) ctx.ui.notify(`📡 Stopped casting to ${count} listener${count > 1 ? 's' : ''}.`, "info");
+        backgroundCasterIds.clear();
+        if (ctx.hasUI) ctx.ui.notify(`📡 Stopped casting to ${count} listener${count > 1 ? 's' : ''}${bgCount > 0 ? ` (${bgCount} background)` : ""}.`, "info");
       }
     },
   });
@@ -1930,6 +1998,7 @@ How to use:
           expectsReply: false,
         });
         casterIds.delete(targetId);
+        backgroundCasterIds.delete(targetId);
         if (ctx.hasUI) ctx.ui.notify(`📻 Stopped listening to "${targetName}".`, "info");
       } else {
         for (const casterId of casterIds) {
@@ -1941,6 +2010,7 @@ How to use:
         }
         const count = casterIds.size;
         casterIds.clear();
+        backgroundCasterIds.clear();
         if (ctx.hasUI) ctx.ui.notify(`📻 Stopped listening to ${count} caster${count > 1 ? 's' : ''}.`, "info");
       }
     },

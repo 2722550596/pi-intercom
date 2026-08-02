@@ -172,7 +172,89 @@ intercom({ action: "pending" })
 - 聊天内容可以结合自己的记忆，比如想起什么有趣的事分享给对面
 - 把 intercom 当作发消息，自然对话就好
 - 你必须得用 `intercom` 发消息，对方才能看到，自言自语或者跟我聊天是看不见的
+
+## 后台模式（多 Agent 叙事）
+
+当你需要**异步通信**——一个 session 广播行动给叙述者，但不触发对方的对话轮次：
+
+- `/cast <name> --background` — 广播输出，消息写入 JSON 队列文件，不触发接收者的 turn
+- `/listen <name> --background` — 后台模式接收广播，消息累积在队列中，等叙述者的 preset 读取
+
+### 使用场景
+
+- **多 Agent RPG** — 角色在后台广播行动；叙述者读取队列消息并编织进故事
+- **异步日志** — worker session 记录事件，不打断主流程
+- **批量更新** — 多个 caster 发送更新；叙述者一次性处理所有
+
+### 设置（多 Agent RPG 示例）
+
 ```
+# 终端 1（叙述者）                   # 终端 2（角色：阿莱莎）
+/name narrator                       /name alyssa
+/preset narrator                     /preset alyssa
+/listen alyssa --background          /cast narrator --background
+/listen leo --background
+
+# 终端 3（角色：雷欧）
+/name leo
+/preset leo
+/cast narrator --background
+```
+
+现在的流程：
+
+- **角色行动** → `send_message` 给叙述者 → 写入 `background-queue.json`
+- **叙述者 turn** → `background-casts` slot 读取队列、注入 prompt、清空文件
+- **叙述者回应** → 用 `send_message` 向相关角色推送场景描写
+
+### 命令
+
+| 命令 | 说明 |
+|------|------|
+| `/cast <name> --background` | 开始后台广播（队列模式）|
+| `/listen <name> --background` | 开始后台收听（队列模式）|
+| `/stopcast [name]` | 停止广播（显示是否曾是后台）|
+| `/unlisten [name]` | 停止收听（清理后台追踪）|
+| `/read-casts` | 预览队列中的后台消息（不清空）|
+| `/clear-casts` | 手动清空后台消息队列 |
+
+### 后台队列文件
+
+消息存储在 `~/.pi/agent/intercom/background-queue.json`：
+
+```json
+[
+  {
+    "from": { "id": "abc123", "name": "leo" },
+    "text": "我冲进仓库，手电筒扫过四周——天哪，这里有一整排旧世界的电池！",
+    "timestamp": 1698765432000
+  }
+]
+```
+
+`background-casts` slot（由项目 extension 注册）在每次 prompt 渲染时读取此文件，
+格式化为 `<background_casts>` XML，然后清空文件（一次性行为）。
+
+### 与 Prompt Preset 集成
+
+在叙述者 preset 中使用后台广播（`.pi/prompt-presets/narrator.json`）：
+
+```json
+{
+  "schemaVersion": 1,
+  "id": "narrator",
+  "mode": "replace",
+  "items": [
+    { "kind": "block", "id": "system", "content": "你是叙述者..." },
+    { "kind": "slot", "slot": "background-casts" },
+    { "kind": "slot", "slot": "chat-history" }
+  ]
+}
+```
+
+`background-casts` slot 由项目 extension `.pi/extensions/background-casts.ts` 注册。
+把它放在你项目的 `.pi/extensions/` 目录，Pi 会自动加载。
+
 ---
 
 ## 键盘快捷键

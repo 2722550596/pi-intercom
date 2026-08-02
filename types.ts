@@ -16,11 +16,14 @@ export interface Message {
   expectsReply?: boolean;
   /** If true, deliver this message as a real user message (sendUserMessage) instead of intercom notification */
   deliverAsUser?: boolean;
+  /** If true, write to background JSON instead of triggering a turn. Coexists with deliverAsUser: false. */
+  background?: boolean;
   content: {
     text: string;
     attachments?: Attachment[];
   };
 }
+
 
 export interface Attachment {
   type: "file" | "snippet" | "context";

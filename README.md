@@ -180,7 +180,94 @@ Now:
 | `/stopcast [name]` | Stop broadcasting (to specific session or all) |
 | `/listen <name>` | Start listening to a session |
 | `/unlisten [name]` | Stop listening (to specific session or all) |
-## Workflow: Character ↔ Game (Duplex)
+
+## Workflow: Background Mode (Multi-Agent Narration)
+
+For scenarios where you want **asynchronous communication** — one session broadcasting
+actions to a narrator without triggering a conversational turn:
+
+- `/cast <name> --background` — broadcast your output to another session, but messages
+  are written to a JSON queue file instead of triggering the recipient's turn.
+- `/listen <name> --background` — receive another session's broadcast in background mode.
+  Messages accumulate in a queue until the narrator's prompt preset reads them.
+
+### Use Cases
+
+- **Multi-agent RPG** — character agents broadcast their actions in the background;
+  the narrator session reads queued actions and weaves them into the story.
+- **Asynchronous logging** — worker sessions log events without interrupting the main process.
+- **Batched updates** — multiple casters send updates; the narrator processes them all at once.
+
+### Setup (Multi-Agent RPG Example)
+
+```
+# Terminal 1 (narrator)              # Terminal 2 (character: alyssa)
+/name narrator                       /name alyssa
+/preset narrator                     /preset alyssa
+/listen alyssa --background          /cast narrator --background
+/listen leo --background
+
+# Terminal 3 (character: leo)
+/name leo
+/preset leo
+/cast narrator --background
+```
+
+Now:
+
+- **Character acts** → `send_message` to narrator → written to `background-queue.json`
+- **Narrator's turn** → `background-casts` slot reads queue, injects into prompt, clears file
+- **Narrator responds** → uses `send_message` to push scene descriptions to relevant characters
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `/cast <name> --background` | Start broadcasting in background mode (queued) |
+| `/listen <name> --background` | Start listening in background mode (queued) |
+| `/stopcast [name]` | Stop broadcasting (shows if was background) |
+| `/unlisten [name]` | Stop listening (cleans up background tracking) |
+| `/read-casts` | Preview queued background messages without clearing |
+| `/clear-casts` | Manually clear the background message queue |
+
+### Background Queue File
+
+Messages are stored at `~/.pi/agent/intercom/background-queue.json`:
+
+```json
+[
+  {
+    "from": { "id": "abc123", "name": "leo" },
+    "text": "我冲进仓库，手电筒扫过四周——天哪，这里有一整排旧世界的电池！",
+    "timestamp": 1698765432000
+  }
+]
+```
+
+The `background-casts` slot (registered by the project extension) reads this file on each
+prompt render, formats it as `<background_casts>` XML, and clears it (one-shot behavior).
+
+### Integration with Prompt Presets
+
+To use background casts in a narrator preset (`.pi/prompt-presets/narrator.json`):
+
+```json
+{
+  "schemaVersion": 1,
+  "id": "narrator",
+  "mode": "replace",
+  "items": [
+    { "kind": "block", "id": "system", "content": "你是叙述者..." },
+    { "kind": "slot", "slot": "background-casts" },
+    { "kind": "slot", "slot": "chat-history" }
+  ]
+}
+```
+
+The `background-casts` slot is registered by the project extension at
+`.pi/extensions/background-casts.ts`. Place it in your project's `.pi/extensions/`
+directory for auto-loading.
+
 
 The most natural RP setup: connect a character agent to a game/story process via
 `/connect`, then both sides talk like normal users. No tool calls needed, no

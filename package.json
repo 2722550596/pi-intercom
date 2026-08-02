@@ -1,10 +1,10 @@
 {
   "name": "pi-intercom-rp",
-  "version": "0.7.4",
+  "version": "0.8.0",
   "license": "MIT",
   "type": "module",
   "main": "index.ts",
-  "description": "Fork: duplex agent-to-agent conversation, send_message tool, /connect protocol",
+  "description": "Fork: duplex agent-to-agent conversation, send_message tool, /connect protocol, background mode for multi-agent narration",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/2722550596/pi-intercom.git"
