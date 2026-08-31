@@ -1,22 +1,35 @@
 import { spawn } from "child_process";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
-import { homedir } from "os";
+import { createRequire } from "module";
 import net from "net";
-import { getBrokerSocketPath } from "./paths.js";
+import { randomUUID } from "crypto";
+import { createMessageReader, writeMessage } from "./framing.ts";
+import {
+  ensureIntercomRuntimeDir,
+  getAgentDirPath,
+  getBrokerConnectTarget,
+  getIntercomDirPath,
+  INTERCOM_PROTOCOL_NAME,
+  INTERCOM_PROTOCOL_VERSION,
+  INTERCOM_RUNTIME_FILE_MODE,
+  restrictIntercomRuntimeFile,
+  type BrokerConnectTarget,
+} from "./paths.ts";
 
-const INTERCOM_DIR = join(homedir(), ".pi/agent/intercom");
+const INTERCOM_DIR = getIntercomDirPath();
 const EXTENSION_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
-const BROKER_SOCKET = getBrokerSocketPath();
 const BROKER_PID = join(INTERCOM_DIR, "broker.pid");
 const BROKER_SPAWN_LOCK = join(INTERCOM_DIR, "broker.spawn.lock");
+const BROKER_STARTUP_STDERR_LIMIT = 4_000;
 
 type BrokerLaunchSpec =
   | {
     kind: "direct";
     command: string;
     args: string[];
+    captureStartupStderr: boolean;
   }
   | {
     kind: "windows-launcher";
@@ -24,6 +37,7 @@ type BrokerLaunchSpec =
     args: string[];
     launcherPath: string;
     launcherCommandLine: string;
+    captureStartupStderr: boolean;
   };
 
 function sleep(ms: number): Promise<void> {
@@ -31,7 +45,23 @@ function sleep(ms: number): Promise<void> {
 }
 
 export function getTsxCliPath(extensionDir: string = EXTENSION_DIR): string {
-  return join(extensionDir, "node_modules", "tsx", "dist", "cli.mjs");
+  // Resolve tsx via Node's module resolution so it works regardless of whether
+  // tsx is bundled under extensionDir/node_modules or hoisted to a workspace
+  // root by npm. We resolve the tsx package main entry (its "exports" field
+  // does not expose ./dist/cli.mjs as a subpath) and then locate cli.mjs next
+  // to it. If resolution fails, prefer the flat plugin-store layout before the
+  // legacy nested fallback.
+  try {
+    const requireFromExtension = createRequire(join(extensionDir, "package.json"));
+    const tsxMain = requireFromExtension.resolve("tsx");
+    return join(dirname(tsxMain), "cli.mjs");
+  } catch {
+    const siblingTsxCli = join(extensionDir, "..", "tsx", "dist", "cli.mjs");
+    if (existsSync(siblingTsxCli)) {
+      return siblingTsxCli;
+    }
+    return join(extensionDir, "node_modules", "tsx", "dist", "cli.mjs");
+  }
 }
 
 function quoteWindowsArg(value: string): string {
@@ -49,6 +79,13 @@ function usesDefaultBrokerCommand(brokerCommand: string, brokerArgs: string[]): 
     && brokerArgs[1] === "tsx";
 }
 
+function getNodeCommand(nodePath: string): string {
+  const executableName = nodePath.split(/[\\/]/).pop();
+  return executableName && /^node(?:js)?(?:\.exe)?$/i.test(executableName)
+    ? nodePath
+    : "node";
+}
+
 export function getWindowsBrokerCommandLine(
   brokerPath: string,
   extensionDir: string = EXTENSION_DIR,
@@ -57,7 +94,7 @@ export function getWindowsBrokerCommandLine(
   brokerArgs: string[] = ["--no-install", "tsx"],
 ): string {
   if (usesDefaultBrokerCommand(brokerCommand, brokerArgs)) {
-    return [quoteWindowsArg(nodePath), quoteWindowsArg(getTsxCliPath(extensionDir)), quoteWindowsArg(brokerPath)].join(" ");
+    return [quoteWindowsArg(getNodeCommand(nodePath)), quoteWindowsArg(getTsxCliPath(extensionDir)), quoteWindowsArg(brokerPath)].join(" ");
   }
 
   return [quoteWindowsArg(brokerCommand), ...brokerArgs.map(quoteWindowsArg), quoteWindowsArg(brokerPath)].join(" ");
@@ -72,12 +109,27 @@ export function getWindowsHiddenLauncherScript(commandLine: string): string {
   ].join("\r\n");
 }
 
-function writeWindowsHiddenLauncher(
+export function isBrokerHealthOkMessage(message: unknown, requestId: string): boolean {
+  if (typeof message !== "object" || message === null || !("type" in message)) {
+    return false;
+  }
+  const response = message as Record<string, unknown>;
+  return response.type === "health_ok"
+    && response.requestId === requestId
+    && response.protocol === INTERCOM_PROTOCOL_NAME
+    && response.version === INTERCOM_PROTOCOL_VERSION;
+}
+
+export function writeWindowsHiddenLauncher(
   commandLine: string,
   launcherPath: string = getWindowsHiddenLauncherPath(),
 ): string {
-  mkdirSync(dirname(launcherPath), { recursive: true });
-  writeFileSync(launcherPath, getWindowsHiddenLauncherScript(commandLine), "utf-8");
+  ensureIntercomRuntimeDir(dirname(launcherPath));
+  writeFileSync(launcherPath, `\uFEFF${getWindowsHiddenLauncherScript(commandLine)}`, {
+    encoding: "utf16le",
+    mode: INTERCOM_RUNTIME_FILE_MODE,
+  });
+  restrictIntercomRuntimeFile(launcherPath);
   return launcherPath;
 }
 
@@ -95,9 +147,19 @@ export function getBrokerLaunchSpec(
     return {
       kind: "windows-launcher",
       command: "wscript.exe",
-      args: [launcherPath],
+      args: ["//E:VBScript", launcherPath],
       launcherPath,
       launcherCommandLine: getWindowsBrokerCommandLine(brokerPath, extensionDir, nodePath, brokerCommand, brokerArgs),
+      captureStartupStderr: false,
+    };
+  }
+
+  if (usesDefaultBrokerCommand(brokerCommand, brokerArgs)) {
+    return {
+      kind: "direct",
+      command: getNodeCommand(nodePath),
+      args: [getTsxCliPath(extensionDir), brokerPath],
+      captureStartupStderr: true,
     };
   }
 
@@ -105,21 +167,26 @@ export function getBrokerLaunchSpec(
     kind: "direct",
     command: brokerCommand,
     args: [...brokerArgs, brokerPath],
+    captureStartupStderr: false,
   };
 }
 
-export function getBrokerSpawnOptions(extensionDir: string = EXTENSION_DIR): {
+export function getBrokerSpawnOptions(
+  extensionDir: string = EXTENSION_DIR,
+  env: NodeJS.ProcessEnv = process.env,
+  captureStderr = true,
+): {
   detached: true;
-  stdio: "ignore";
+  stdio: "ignore" | ["ignore", "ignore", "pipe"];
   cwd: string;
   env: NodeJS.ProcessEnv;
   windowsHide: true;
 } {
   return {
     detached: true,
-    stdio: "ignore",
+    stdio: captureStderr ? ["ignore", "ignore", "pipe"] : "ignore",
     cwd: extensionDir,
-    env: { ...process.env, NODE_NO_WARNINGS: "1" },
+    env: { ...env, PI_CODING_AGENT_DIR: getAgentDirPath(env), NODE_NO_WARNINGS: "1" },
     windowsHide: true,
   };
 }
@@ -129,7 +196,7 @@ function toError(error: unknown): Error {
 }
 
 export async function spawnBrokerIfNeeded(brokerCommand: string, brokerArgs: string[]): Promise<void> {
-  mkdirSync(INTERCOM_DIR, { recursive: true });
+  ensureIntercomRuntimeDir(INTERCOM_DIR);
 
   if (await isBrokerRunning()) {
     return;
@@ -151,18 +218,31 @@ export async function spawnBrokerIfNeeded(brokerCommand: string, brokerArgs: str
     if (launch.kind === "windows-launcher") {
       writeWindowsHiddenLauncher(launch.launcherCommandLine, launch.launcherPath);
     }
-    const child = spawn(launch.command, launch.args, getBrokerSpawnOptions());
+    const child = spawn(launch.command, launch.args, getBrokerSpawnOptions(EXTENSION_DIR, process.env, launch.captureStartupStderr));
+    let brokerStderr = "";
+    const rememberBrokerStderr = (chunk: Buffer | string) => {
+      brokerStderr = `${brokerStderr}${chunk.toString()}`.slice(-BROKER_STARTUP_STDERR_LIMIT);
+    };
+    const brokerStartupError = (message: string, cause?: unknown) => {
+      const stderr = brokerStderr.trim();
+      const errorMessage = stderr ? `${message}\nBroker stderr:\n${stderr}` : message;
+      return cause === undefined ? new Error(errorMessage) : new Error(errorMessage, { cause });
+    };
+    child.stderr?.on("data", rememberBrokerStderr);
+    child.stderr?.unref();
     child.unref();
 
     await new Promise<void>((resolve, reject) => {
       const cleanup = () => {
+        child.stderr?.off("data", rememberBrokerStderr);
+        child.stderr?.resume();
         child.off("error", onError);
-        child.off("exit", onExit);
+        child.off("close", onExit);
       };
 
       const onError = (error: Error) => {
         cleanup();
-        reject(new Error(`Failed to spawn intercom broker: ${error.message}`, { cause: error }));
+        reject(brokerStartupError(`Failed to spawn intercom broker: ${error.message}`, error));
       };
 
       const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
@@ -171,20 +251,21 @@ export async function spawnBrokerIfNeeded(brokerCommand: string, brokerArgs: str
         }
         cleanup();
         if (signal) {
-          reject(new Error(`Intercom broker exited before startup with signal ${signal}`));
+          reject(brokerStartupError(`Intercom broker exited before startup with signal ${signal}`));
           return;
         }
-        reject(new Error(`Intercom broker exited before startup with code ${code ?? "unknown"}`));
+        reject(brokerStartupError(`Intercom broker exited before startup with code ${code ?? "unknown"}`));
       };
 
       child.once("error", onError);
-      child.once("exit", onExit);
+      child.once("close", onExit);
       waitForBroker().then(() => {
         cleanup();
         resolve();
       }, (error) => {
         cleanup();
-        reject(toError(error));
+        const startupError = toError(error);
+        reject(brokerStartupError(startupError.message, startupError));
       });
     });
   } finally {
@@ -210,29 +291,57 @@ async function isBrokerRunning(): Promise<boolean> {
   }
 }
 
+function connectToBrokerTarget(target: BrokerConnectTarget): net.Socket {
+  return typeof target === "string"
+    ? net.connect(target)
+    : net.connect({ host: target.host, port: target.port });
+}
+
 function checkSocketConnectable(): Promise<boolean> {
   return new Promise((resolve) => {
-    const socket = net.connect(BROKER_SOCKET);
+    let target: BrokerConnectTarget;
+    try {
+      target = getBrokerConnectTarget();
+    } catch {
+      resolve(false);
+      return;
+    }
+
+    const socket = connectToBrokerTarget(target);
+    const requestId = randomUUID();
+    const expectedStateId = typeof target === "string" ? undefined : target.stateId;
+    let settled = false;
     const finish = (isConnected: boolean) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
       clearTimeout(timeout);
       socket.off("connect", onConnect);
       socket.off("error", onError);
+      socket.off("data", reader);
+      socket.destroy();
       resolve(isConnected);
     };
     const onConnect = () => {
-      socket.end();
-      finish(true);
+      try {
+        writeMessage(socket, {
+          type: "health",
+          requestId,
+          ...(expectedStateId ? { stateId: expectedStateId } : {}),
+        });
+      } catch {
+        finish(false);
+      }
     };
-    const onError = () => {
-      socket.destroy();
-      finish(false);
-    };
+    const onError = () => finish(false);
+    const reader = createMessageReader((message) => {
+      finish(isBrokerHealthOkMessage(message, requestId));
+    }, () => finish(false));
     socket.on("connect", onConnect);
     socket.on("error", onError);
-    const timeout = setTimeout(() => {
-      socket.destroy();
-      finish(false);
-    }, 1000);
+    socket.on("data", reader);
+    const timeout = setTimeout(() => finish(false), 1000);
   });
 }
 
@@ -240,7 +349,11 @@ function acquireSpawnLock(): boolean {
   const maxRetries = 5;
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
-      writeFileSync(BROKER_SPAWN_LOCK, `${process.pid}\n${Date.now()}\n`, { flag: "wx" });
+      writeFileSync(BROKER_SPAWN_LOCK, `${process.pid}\n${Date.now()}\n`, {
+        flag: "wx",
+        mode: INTERCOM_RUNTIME_FILE_MODE,
+      });
+      restrictIntercomRuntimeFile(BROKER_SPAWN_LOCK);
       return true;
     } catch (error) {
       if (!(error instanceof Error) || (error as NodeJS.ErrnoException).code !== "EEXIST") {

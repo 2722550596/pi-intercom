@@ -5,6 +5,10 @@
 **This fork is built for roleplay (RP):** run a character agent in one terminal,
 a game/story process in another, and let them communicate naturally.
 
+> **Version 0.13.0** — rebased on upstream `pi-intercom` 0.12.1 (mailbox offline
+> queue, liveness heartbeat, scoped routing, protocol versioning) with the RP
+> features below preserved on top.
+
 Key differences from upstream:
 - `/connect <name>` — duplex chat channel: once connected, both sides' messages
   inject as real user input and responses auto-forward. No tools needed.

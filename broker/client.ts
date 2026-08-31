@@ -1,24 +1,39 @@
 import { EventEmitter } from "events";
 import net from "net";
 import { randomUUID } from "crypto";
-import { writeMessage, createMessageReader } from "./framing.js";
-import { getBrokerSocketPath } from "./paths.js";
-import type { SessionInfo, Message, Attachment } from "../types.js";
-
-const BROKER_SOCKET = getBrokerSocketPath();
+import { writeMessage, createMessageReader } from "./framing.ts";
+import { getBrokerConnectTarget, type BrokerConnectTarget } from "./paths.ts";
+import { isMessage, isMessageControl, isMessageReceipt, isSessionInfo } from "./protocol.ts";
+import { getIntercomScopeId } from "../config.ts";
+import { EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, type DeliveryDetails } from "../types.ts";
+import type {
+  Attachment,
+  BrokerMessage,
+  ClientMessage,
+  Message,
+  MessageControl,
+  MessageProvenance,
+  MessageReceipt,
+  SessionInfo,
+  SessionRegistration,
+} from "../types.ts";
 
 interface SendOptions {
   text: string;
   attachments?: Attachment[];
   replyTo?: string;
   expectsReply?: boolean;
-  deliverAsUser?: boolean;
-  /** If true, write to background JSON instead of triggering a turn */
-  background?: boolean;
   messageId?: string;
+  supersedes?: string;
+  retryOf?: string;
+  provenance?: MessageProvenance;
+  /** RP fork: deliver as a real user message on the receiving side. */
+  deliverAsUser?: boolean;
+  /** RP fork: write to the background JSON queue instead of triggering a turn. */
+  background?: boolean;
 }
 
-interface SendResult {
+export interface SendResult extends DeliveryDetails {
   id: string;
   delivered: boolean;
   reason?: string;
@@ -28,96 +43,41 @@ function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
 
-function isAttachment(value: unknown): value is Attachment {
-  if (typeof value !== "object" || value === null) {
-    return false;
-  }
-
-  const attachment = value as Record<string, unknown>;
-
-  if (
-    attachment.type !== "file"
-    && attachment.type !== "snippet"
-    && attachment.type !== "context"
-  ) {
-    return false;
-  }
-
-  if (typeof attachment.name !== "string" || typeof attachment.content !== "string") {
-    return false;
-  }
-
-  return attachment.language === undefined || typeof attachment.language === "string";
+/**
+ * Liveness heartbeat interval. A half-open socket (peer killed with SIGKILL or
+ * crashed without sending a FIN) stays "writable" indefinitely, so passive
+ * close-event detection never fires and the client silently drops out of the
+ * roster. The heartbeat actively round-trips a lightweight request and tears
+ * down the socket if the broker does not respond within the timeout, letting
+ * the existing onClose -> "disconnected" path drive reconnection.
+ */
+function getLivenessIntervalMs(): number {
+  const raw = Number.parseInt(process.env.PI_INTERCOM_LIVENESS_INTERVAL_MS ?? "", 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 30_000;
 }
 
-function isMessage(value: unknown): value is Message {
-  if (typeof value !== "object" || value === null) {
-    return false;
-  }
-
-  const message = value as Record<string, unknown>;
-
-  if (typeof message.id !== "string" || typeof message.timestamp !== "number") {
-    return false;
-  }
-
-  if (message.replyTo !== undefined && typeof message.replyTo !== "string") {
-    return false;
-  }
-
-  if (message.expectsReply !== undefined && typeof message.expectsReply !== "boolean") {
-    return false;
-  }
-
-  if (message.deliverAsUser !== undefined && typeof message.deliverAsUser !== "boolean") {
-    return false;
-  }
-
-  if (typeof message.content !== "object" || message.content === null) {
-    return false;
-  }
-
-  const content = message.content as Record<string, unknown>;
-  if (typeof content.text !== "string") {
-    return false;
-  }
-
-  return content.attachments === undefined
-    || (Array.isArray(content.attachments) && content.attachments.every(isAttachment));
+function getLivenessTimeoutMs(): number {
+  const raw = Number.parseInt(process.env.PI_INTERCOM_LIVENESS_TIMEOUT_MS ?? "", 10);
+  return Number.isFinite(raw) && raw > 0 ? Math.min(raw, getLivenessIntervalMs()) : 5_000;
 }
 
-function isSessionInfo(value: unknown): value is SessionInfo {
-  if (typeof value !== "object" || value === null) {
-    return false;
-  }
-
-  const session = value as Record<string, unknown>;
-
-  if (
-    typeof session.id !== "string"
-    || typeof session.cwd !== "string"
-    || typeof session.model !== "string"
-    || typeof session.pid !== "number"
-    || typeof session.startedAt !== "number"
-    || typeof session.lastActivity !== "number"
-  ) {
-    return false;
-  }
-
-  if (session.name !== undefined && typeof session.name !== "string") {
-    return false;
-  }
-
-  return session.status === undefined || typeof session.status === "string";
+function connectToBrokerTarget(target: BrokerConnectTarget): net.Socket {
+  return typeof target === "string"
+    ? net.connect(target)
+    : net.connect({ host: target.host, port: target.port });
 }
 
 export class IntercomClient extends EventEmitter {
   private socket: net.Socket | null = null;
   private _sessionId: string | null = null;
+  private _features = new Set<string>();
   private pendingSends = new Map<string, { resolve: (r: SendResult) => void; reject: (e: Error) => void }>();
   private pendingLists = new Map<string, { resolve: (sessions: SessionInfo[]) => void; reject: (e: Error) => void }>();
+  private nextSenderSequence = 1;
   private disconnecting = false;
   private disconnectError: Error | null = null;
+  private livenessTimer: NodeJS.Timeout | null = null;
+  private livenessInFlight = false;
 
   private failPending(error: Error): void {
     for (const pending of this.pendingSends.values()) {
@@ -134,9 +94,57 @@ export class IntercomClient extends EventEmitter {
     return this._sessionId;
   }
 
+  supportsFeature(feature: string): boolean {
+    return this._features.has(feature);
+  }
+
   isConnected(): boolean {
     const socket = this.socket;
     return Boolean(socket && this._sessionId && !this.disconnecting && !socket.destroyed && !socket.writableEnded && socket.writable);
+  }
+
+  /**
+   * Start the liveness heartbeat. Must be called once the connection is
+   * registered. The heartbeat periodically round-trips a lightweight list
+   * request and tears down the socket if the broker does not respond within
+   * the liveness timeout, so a half-open connection is detected within a
+   * bounded window instead of silently lingering forever.
+   */
+  private startLivenessHeartbeat(): void {
+    this.stopLivenessHeartbeat();
+    this.livenessTimer = setInterval(() => {
+      this.runLivenessProbe();
+    }, getLivenessIntervalMs());
+    this.livenessTimer.unref?.();
+  }
+
+  private stopLivenessHeartbeat(): void {
+    if (this.livenessTimer) {
+      clearInterval(this.livenessTimer);
+      this.livenessTimer = null;
+    }
+    this.livenessInFlight = false;
+  }
+
+  private async runLivenessProbe(): Promise<void> {
+    if (this.livenessInFlight || !this.isConnected()) {
+      return;
+    }
+    this.livenessInFlight = true;
+    try {
+      await this.listSessions({ timeoutMs: getLivenessTimeoutMs() });
+    } catch (error) {
+      // A timeout or write error means the socket is half-open: the broker is
+      // gone but the OS never delivered a close event. Destroy the socket so
+      // the onClose handler emits "disconnected" and the extension reconnects.
+      const socket = this.socket;
+      if (socket && !socket.destroyed) {
+        this.disconnectError = toError(error);
+        socket.destroy();
+      }
+    } finally {
+      this.livenessInFlight = false;
+    }
   }
 
   private requireActiveSocket(): net.Socket {
@@ -156,13 +164,21 @@ export class IntercomClient extends EventEmitter {
     return socket;
   }
 
-  connect(session: Omit<SessionInfo, "id">): Promise<void> {
+  connect(session: SessionRegistration, sessionId?: string): Promise<void> {
     if (this.socket) {
       return Promise.reject(new Error("Already connected"));
     }
 
     return new Promise((resolve, reject) => {
-      const socket = net.connect(BROKER_SOCKET);
+      let socket: net.Socket;
+      let target: BrokerConnectTarget;
+      try {
+        target = getBrokerConnectTarget();
+        socket = connectToBrokerTarget(target);
+      } catch (error) {
+        reject(toError(error));
+        return;
+      }
       this.socket = socket;
       this.disconnectError = null;
       let settled = false;
@@ -184,6 +200,7 @@ export class IntercomClient extends EventEmitter {
         settled = true;
         connectionEstablished = true;
         cleanupConnectionAttempt();
+        this.startLivenessHeartbeat();
         resolve();
       };
       
@@ -203,6 +220,7 @@ export class IntercomClient extends EventEmitter {
         const wasDisconnecting = this.disconnecting;
         const disconnectError = this.disconnectError ?? new Error("Client disconnected");
         this.disconnecting = false;
+        this.stopLivenessHeartbeat();
         cleanupConnectionAttempt();
         cleanupSocketListeners();
         this.failPending(disconnectError);
@@ -210,6 +228,7 @@ export class IntercomClient extends EventEmitter {
           this.socket = null;
         }
         this._sessionId = null;
+        this._features.clear();
         this.disconnectError = null;
         if (connectionEstablished && !wasDisconnecting) {
           this.emit("disconnected", disconnectError);
@@ -223,6 +242,13 @@ export class IntercomClient extends EventEmitter {
         if (connectionEstablished) {
           this.disconnectError = err;
           this.emit("error", err);
+          // A socket error after registration means the connection is dead.
+          // Destroy the socket so onClose fires and emits "disconnected",
+          // driving the extension's reconnect path. Without this, a half-open
+          // socket can linger with isConnected() returning true.
+          if (!socket.destroyed) {
+            socket.destroy();
+          }
         }
       };
 
@@ -261,7 +287,14 @@ export class IntercomClient extends EventEmitter {
       this.once("_registered", onRegistered);
       
       try {
-        writeMessage(socket, { type: "register", session });
+        const scopeId = getIntercomScopeId();
+        writeMessage(socket, {
+          type: "register",
+          session,
+          ...(sessionId ? { sessionId } : {}),
+          ...(scopeId ? { scopeId } : {}),
+          ...(typeof target === "string" ? {} : { stateId: target.stateId }),
+        });
       } catch (error) {
         cleanupConnectionAttempt();
         cleanupSocketListeners();
@@ -281,7 +314,7 @@ export class IntercomClient extends EventEmitter {
 
     const brokerMessage = msg as { type: string } & Record<string, unknown>;
 
-    if (this._sessionId === null && brokerMessage.type !== "registered") {
+    if (this._sessionId === null && brokerMessage.type !== "registered" && brokerMessage.type !== "error") {
       throw new Error(`Received ${brokerMessage.type} before registered`);
     }
 
@@ -295,8 +328,22 @@ export class IntercomClient extends EventEmitter {
           throw new Error("Received duplicate registered message");
         }
 
+        if (
+          brokerMessage.features !== undefined
+          && (!Array.isArray(brokerMessage.features) || !brokerMessage.features.every((feature) => typeof feature === "string"))
+        ) {
+          throw new Error("Invalid registered features");
+        }
+
         this._sessionId = brokerMessage.sessionId;
-        this.emit("_registered", { type: "registered", sessionId: brokerMessage.sessionId });
+        this._features = new Set((brokerMessage.features as string[] | undefined) ?? []);
+        const registered: BrokerMessage = {
+          type: "registered",
+          sessionId: brokerMessage.sessionId,
+          ...(this._features.size > 0 ? { features: [...this._features] } : {}),
+        };
+        this.emit("broker_message", registered);
+        this.emit("_registered", registered);
         break;
       }
 
@@ -328,8 +375,8 @@ export class IntercomClient extends EventEmitter {
       }
 
       case "delivered": {
-        const { messageId } = brokerMessage;
-        if (typeof messageId !== "string") {
+        const { messageId, delivery, retryable, outcomeKnown } = brokerMessage;
+        if (typeof messageId !== "string" || (delivery !== undefined && delivery !== "socket_delivered" && delivery !== "queued") || (retryable !== undefined && typeof retryable !== "boolean") || (outcomeKnown !== undefined && typeof outcomeKnown !== "boolean")) {
           throw new Error("Invalid delivered message");
         }
 
@@ -340,13 +387,13 @@ export class IntercomClient extends EventEmitter {
         }
 
         this.pendingSends.delete(messageId);
-        pending.resolve({ id: messageId, delivered: true });
+        pending.resolve({ id: messageId, delivered: true, delivery: delivery as "socket_delivered" | "queued" | undefined ?? "socket_delivered", retryable: retryable as boolean | undefined ?? false, outcomeKnown: outcomeKnown as boolean | undefined ?? true, ...(typeof brokerMessage.code === "string" ? { code: brokerMessage.code } : {}) });
         break;
       }
 
       case "delivery_failed": {
-        const { messageId, reason } = brokerMessage;
-        if (typeof messageId !== "string" || typeof reason !== "string") {
+        const { messageId, reason, delivery, retryable, outcomeKnown } = brokerMessage;
+        if (typeof messageId !== "string" || typeof reason !== "string" || (delivery !== undefined && delivery !== "failed" && delivery !== "unknown") || (retryable !== undefined && typeof retryable !== "boolean") || (outcomeKnown !== undefined && typeof outcomeKnown !== "boolean")) {
           throw new Error("Invalid delivery_failed message");
         }
 
@@ -357,7 +404,25 @@ export class IntercomClient extends EventEmitter {
         }
 
         this.pendingSends.delete(messageId);
-        pending.resolve({ id: messageId, delivered: false, reason });
+        pending.resolve({ id: messageId, delivered: false, reason, delivery: delivery as "failed" | "unknown" | undefined ?? "failed", retryable: retryable as boolean | undefined ?? false, outcomeKnown: outcomeKnown as boolean | undefined ?? true, ...(typeof brokerMessage.code === "string" ? { code: brokerMessage.code } : {}) });
+        break;
+      }
+
+      case "message_receipt": {
+        if (!isSessionInfo(brokerMessage.from) || !isMessageReceipt(brokerMessage.receipt)) {
+          throw new Error("Invalid message_receipt event");
+        }
+        this.emit("broker_message", brokerMessage as BrokerMessage);
+        this.emit("message_receipt", brokerMessage.from, brokerMessage.receipt);
+        break;
+      }
+
+      case "message_control": {
+        if (!isSessionInfo(brokerMessage.from) || !isMessageControl(brokerMessage.control)) {
+          throw new Error("Invalid message_control event");
+        }
+        this.emit("broker_message", brokerMessage as BrokerMessage);
+        this.emit("message_control", brokerMessage.from, brokerMessage.control);
         break;
       }
 
@@ -366,6 +431,8 @@ export class IntercomClient extends EventEmitter {
           throw new Error("Invalid session_joined message");
         }
 
+        const message: BrokerMessage = { type: "session_joined", session: brokerMessage.session };
+        this.emit("broker_message", message);
         this.emit("session_joined", brokerMessage.session);
         break;
       }
@@ -375,6 +442,8 @@ export class IntercomClient extends EventEmitter {
           throw new Error("Invalid session_left message");
         }
 
+        const message: BrokerMessage = { type: "session_left", sessionId: brokerMessage.sessionId };
+        this.emit("broker_message", message);
         this.emit("session_left", brokerMessage.sessionId);
         break;
       }
@@ -384,6 +453,8 @@ export class IntercomClient extends EventEmitter {
           throw new Error("Invalid presence_update message");
         }
 
+        const message: BrokerMessage = { type: "presence_update", session: brokerMessage.session };
+        this.emit("broker_message", message);
         this.emit("presence_update", brokerMessage.session);
         break;
       }
@@ -393,7 +464,71 @@ export class IntercomClient extends EventEmitter {
           throw new Error("Invalid error message");
         }
 
+        if (this._sessionId === null) {
+          throw new Error(brokerMessage.error);
+        }
         this.emit("error", new Error(brokerMessage.error));
+        break;
+      }
+
+      case "extension_owner": {
+        const hasOwnerId = typeof brokerMessage.ownerId === "string";
+        const hasOwnerEpoch = typeof brokerMessage.ownerEpoch === "string";
+        if (
+          typeof brokerMessage.namespace !== "string"
+          || hasOwnerId !== hasOwnerEpoch
+          || (brokerMessage.ownerId !== undefined && !hasOwnerId)
+          || (brokerMessage.ownerEpoch !== undefined && !hasOwnerEpoch)
+        ) {
+          throw new Error("Invalid extension_owner message");
+        }
+        this.emit("broker_message", brokerMessage as BrokerMessage);
+        this.emit("extension_owner", brokerMessage);
+        break;
+      }
+
+      case "extension_message": {
+        const hasOwnerId = typeof brokerMessage.ownerId === "string";
+        const hasOwnerEpoch = typeof brokerMessage.ownerEpoch === "string";
+        if (
+          typeof brokerMessage.namespace !== "string"
+          || typeof brokerMessage.fromSessionId !== "string"
+          || hasOwnerId !== hasOwnerEpoch
+          || (brokerMessage.ownerId !== undefined && !hasOwnerId)
+          || (brokerMessage.ownerEpoch !== undefined && !hasOwnerEpoch)
+        ) {
+          throw new Error("Invalid extension_message");
+        }
+        this.emit("broker_message", brokerMessage as BrokerMessage);
+        this.emit("extension_message", brokerMessage);
+        break;
+      }
+
+      case "extension_state": {
+        if (
+          typeof brokerMessage.namespace !== "string"
+          || !Number.isSafeInteger(brokerMessage.revision)
+          || Number(brokerMessage.revision) < 0
+        ) {
+          throw new Error("Invalid extension_state");
+        }
+        this.emit("broker_message", brokerMessage as BrokerMessage);
+        this.emit("extension_state", brokerMessage);
+        break;
+      }
+
+      case "extension_state_result": {
+        if (
+          typeof brokerMessage.namespace !== "string"
+          || typeof brokerMessage.committed !== "boolean"
+          || !Number.isSafeInteger(brokerMessage.revision)
+          || Number(brokerMessage.revision) < 0
+          || (brokerMessage.reason !== undefined && typeof brokerMessage.reason !== "string")
+        ) {
+          throw new Error("Invalid extension_state_result");
+        }
+        this.emit("broker_message", brokerMessage as BrokerMessage);
+        this.emit("extension_state_result", brokerMessage);
         break;
       }
 
@@ -410,6 +545,7 @@ export class IntercomClient extends EventEmitter {
 
     this.disconnecting = true;
     this.disconnectError = null;
+    this.stopLivenessHeartbeat();
     this.failPending(new Error("Client disconnected"));
 
     await new Promise<void>((resolve) => {
@@ -445,7 +581,13 @@ export class IntercomClient extends EventEmitter {
     });
   }
 
-  listSessions(): Promise<SessionInfo[]> {
+  updateExtensionCapabilities(extensions: SessionRegistration["extensions"]): void {
+    if (!this.supportsFeature(EXTENSION_BUS_FEATURE)) return;
+    const socket = this.requireActiveSocket();
+    writeMessage(socket, { type: "extension_capabilities_update", extensions: extensions ?? [] });
+  }
+
+  listSessions(options: { timeoutMs?: number } = {}): Promise<SessionInfo[]> {
     let socket: net.Socket;
     try {
       socket = this.requireActiveSocket();
@@ -468,7 +610,7 @@ export class IntercomClient extends EventEmitter {
           this.pendingLists.delete(requestId);
           wrappedReject(new Error("List sessions timeout"));
         }
-      }, 5000);
+      }, options.timeoutMs ?? 5000);
       this.pendingLists.set(requestId, { resolve: wrappedResolve, reject: wrappedReject });
       try {
         writeMessage(socket, { type: "list", requestId });
@@ -480,28 +622,33 @@ export class IntercomClient extends EventEmitter {
     });
   }
 
-  send(to: string, options: SendOptions): Promise<SendResult> {
+  async send(to: string, options: SendOptions): Promise<SendResult> {
     let socket: net.Socket;
     try {
       socket = this.requireActiveSocket();
     } catch (error) {
-      return Promise.reject(toError(error));
+      throw toError(error);
     }
+    
     const messageId = options.messageId ?? randomUUID();
     const message: Message = {
       id: messageId,
       timestamp: Date.now(),
+      senderSequence: this.nextSenderSequence++,
+      supersedes: options.supersedes,
+      retryOf: options.retryOf,
       replyTo: options.replyTo,
       expectsReply: options.expectsReply,
       deliverAsUser: options.deliverAsUser,
       background: options.background,
+      provenance: options.provenance,
       content: {
         text: options.text,
         attachments: options.attachments,
       },
     };
 
-    return new Promise((resolve, reject) => {
+    const sendOnce = (targetId?: string, targetEpoch?: string): Promise<SendResult> => new Promise((resolve, reject) => {
       const wrappedResolve = (result: SendResult) => {
         clearTimeout(timeout);
         resolve(result);
@@ -519,7 +666,63 @@ export class IntercomClient extends EventEmitter {
       this.pendingSends.set(messageId, { resolve: wrappedResolve, reject: wrappedReject });
 
       try {
-        writeMessage(socket, { type: "send", to, message });
+        writeMessage(socket, { type: "send", to, message, ...(targetId && targetEpoch ? { targetId, targetEpoch } : {}) });
+      } catch (error) {
+        clearTimeout(timeout);
+        this.pendingSends.delete(messageId);
+        reject(toError(error));
+      }
+    });
+
+    if (!this.supportsFeature(EXACT_SEND_FEATURE) || options.replyTo) {
+      return sendOnce();
+    }
+
+    const resolveTarget = async (): Promise<{ id: string; epoch: string } | null> => {
+      const sessions = await this.listSessions();
+      const byId = sessions.find((session) => session.id === to);
+      const byName = byId ? [] : sessions.filter((session) => session.name?.toLowerCase() === to.toLowerCase());
+      const byPrefix = byId || byName.length > 0 ? [] : sessions.filter((session) => session.id.startsWith(to));
+      const matches = byId ? [byId] : byName.length > 0 ? byName : byPrefix;
+      const target = matches.length === 1 ? matches[0]! : null;
+      return target?.endpointEpoch ? { id: target.id, epoch: target.endpointEpoch } : null;
+    };
+
+    const target = await resolveTarget();
+    if (!target) return sendOnce();
+    const result = await sendOnce(target.id, target.epoch);
+    if (result.code !== "E_TARGET_REBOUND") return result;
+    const reboundTarget = await resolveTarget();
+    return reboundTarget ? sendOnce(reboundTarget.id, reboundTarget.epoch) : result;
+  }
+
+  cancelMessage(messageId: string): Promise<SendResult> {
+    let socket: net.Socket;
+    try {
+      socket = this.requireActiveSocket();
+    } catch (error) {
+      return Promise.reject(toError(error));
+    }
+
+    return new Promise((resolve, reject) => {
+      const wrappedResolve = (result: SendResult) => {
+        clearTimeout(timeout);
+        resolve(result);
+      };
+      const wrappedReject = (error: Error) => {
+        clearTimeout(timeout);
+        reject(error);
+      };
+      const timeout = setTimeout(() => {
+        if (this.pendingSends.has(messageId)) {
+          this.pendingSends.delete(messageId);
+          wrappedReject(new Error("Cancel timeout"));
+        }
+      }, 10000);
+      this.pendingSends.set(messageId, { resolve: wrappedResolve, reject: wrappedReject });
+
+      try {
+        writeMessage(socket, { type: "cancel_message", messageId });
       } catch (error) {
         clearTimeout(timeout);
         this.pendingSends.delete(messageId);
@@ -528,7 +731,37 @@ export class IntercomClient extends EventEmitter {
     });
   }
 
-  updatePresence(updates: { name?: string; status?: string; model?: string }): void {
+  sendMessageReceipt(receipt: MessageReceipt): void {
+    if (this.disconnecting) {
+      return;
+    }
+
+    const socket = this.socket;
+    if (!socket || !this._sessionId || socket.destroyed || socket.writableEnded || !socket.writable) {
+      return;
+    }
+
+    writeMessage(socket, { type: "message_receipt", receipt });
+  }
+
+  cancelAsk(messageId: string): void {
+    if (this.disconnecting) {
+      return;
+    }
+
+    const socket = this.socket;
+    if (!socket || !this._sessionId || socket.destroyed || socket.writableEnded || !socket.writable) {
+      return;
+    }
+
+    try {
+      writeMessage(socket, { type: "cancel_ask", messageId });
+    } catch {
+      // Cancellation is best-effort; local waiter cleanup must still proceed.
+    }
+  }
+
+  updatePresence(updates: { name?: string; runtimeFallbackAlias?: boolean; status?: string; model?: string; contextPct?: number | null; contextTokens?: number | null; contextWindow?: number | null }): void {
     if (this.disconnecting) {
       return;
     }
@@ -539,5 +772,28 @@ export class IntercomClient extends EventEmitter {
     }
 
     writeMessage(socket, { type: "presence", ...updates });
+  }
+
+  sendExtensionMessage(message: Extract<ClientMessage, { type: "extension_publish" | "extension_state_commit" }>): void {
+    if (!this.supportsFeature(EXTENSION_BUS_FEATURE)) {
+      throw new Error(`Connected broker does not support ${EXTENSION_BUS_FEATURE}`);
+    }
+    const socket = this.requireActiveSocket();
+    writeMessage(socket, message);
+  }
+
+  onBrokerMessage(handler: (message: BrokerMessage) => void): () => void {
+    this.on("broker_message", handler);
+    return () => this.off("broker_message", handler);
+  }
+
+  onMessageReceipt(handler: (from: SessionInfo, receipt: MessageReceipt) => void): () => void {
+    this.on("message_receipt", handler);
+    return () => this.off("message_receipt", handler);
+  }
+
+  onMessageControl(handler: (from: SessionInfo, control: MessageControl) => void): () => void {
+    this.on("message_control", handler);
+    return () => this.off("message_control", handler);
   }
 }
