@@ -4,6 +4,113 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 
 ## [Unreleased]
 
+### Added
+- Added `/alias <name>` plus the interactive `/alias` and `/alias menu` forms for naming the current session. The alias is published immediately and reused by existing intercom list, send, reply, overlay, and incoming-message displays. Thanks to [@yceachan](https://github.com/yceachan) for issue #122.
+
+### Fixed
+- Write the hidden Windows broker launcher as UTF-16LE with a BOM and explicitly select the VBScript engine so startup works with non-ASCII paths and WSH configurations that cannot infer `.vbs`. Thanks to [@maelo1028](https://github.com/maelo1028) for issue #121 and [@Agustin-Prieto](https://github.com/Agustin-Prieto) for issue #123.
+
+## [0.12.1] - 2026-08-29
+
+### Highlights
+- Replies to inbound asks are now harder to send to the wrong local session by mistake.
+- The `intercom` tool now stays in the active tool set, which avoids a late-session prompt-cache reset when intercom first becomes useful.
+- Existing configs that still mention `toolVisibility` keep loading; the old setting is simply ignored.
+
+### Fixed
+- Refuse non-reply `send` calls to a different target during a turn triggered by an inbound ask, preventing CWD hierarchy or roster guesses from misdirecting replies. Thanks to [@yceachan](https://github.com/yceachan) for issue #117.
+
+### Removed
+- Removed `toolVisibility` and the `after-first-use` reveal path. The generic `intercom` schema and prompt snippet now stay stable for provider prompt caches, and existing `toolVisibility` config keys are ignored. Thanks to [@XWIlluDelu](https://github.com/XWIlluDelu) for issue #118.
+
+## [0.12.0] - 2026-08-22
+
+### Highlights
+- Extensions can now ask pi-intercom to send a message through the current session without losing user consent, sender attribution, or delivery feedback.
+- Teams can isolate intercom traffic with `PI_INTERCOM_SCOPE_ID`, so unrelated sessions do not see or receive each other's scoped messages.
+- The generic `intercom` tool can stay hidden until it is first useful, keeping quiet sessions less cluttered.
+
+### Added
+- Added a consent-aware extension outbox API with `intercom:outbox-request` and `intercom:outbox-result` events for notify-only same-process extension sends. Outbox sends honor `confirmSend`, always return a terminal result for valid request IDs, use scoped target resolution, and leave attributed sender-side transcript traces. Thanks to [@elecnix](https://github.com/elecnix) for #110.
+- Added opt-in broker-enforced routing scopes through `PI_INTERCOM_SCOPE_ID`. Scoped sessions only see, route, recover mailbox messages, receive presence events, and use extension-bus owner, publish, and state traffic with sessions in the exact same opaque scope. Unscoped sessions keep existing behavior. Thanks to [@YeungKC](https://github.com/YeungKC) for issue #112.
+- Added opt-in `after-first-use` visibility for the generic `intercom` tool, keeping its model schema and prompt out of unused sessions until an inbound message, overlay send, or bundled skill load reveals it. Broker reception and the child-only `contact_supervisor` tool remain available while it is hidden. Thanks to [@XWIlluDelu](https://github.com/XWIlluDelu) for PR #111.
+
+## [0.11.0] - 2026-08-19
+
+### Highlights
+- Messages can no longer land on a stale peer: if the target session restarted or was replaced, the send fails clearly or retries against the live session instead of silently reaching the wrong endpoint.
+- Retrying a send with the same message ID is now safe. Identical retries never deliver twice, and reusing an ID with different content is rejected.
+- Send results now include structured delivery details (state, error code, whether a retry is safe), so failures are actionable instead of guesswork.
+- The session list now shows each peer's tmux pane ID, making it easier to find and drive the right terminal.
+- Delivered blocking asks leave a local pending-ask record, so you can see what a peer is still waiting on.
+
+### Added
+- Endpoint-bound direct delivery: sends target the exact live session and safely retry once when the target reconnects mid-send, with bounded replay protection for repeated message IDs. Thanks to [@xiangbianpangde](https://github.com/xiangbianpangde) for #106.
+- Local pending-ask records for delivered blocking asks. Thanks to [@bcanvural](https://github.com/bcanvural) for issue #104.
+- tmux pane IDs in the session roster. Thanks to [@odfalik](https://github.com/odfalik) for issue #102 and PR #101.
+
+### Changed
+- Reusing a message ID with different content now fails with a clear error instead of relying on receiver-side duplicate suppression.
+- Clarified that agents should re-list stale intercom session IDs and skip self-targets.
+
+## [0.10.1] - 2026-08-12
+
+### Fixed
+- Resolve the default broker `tsx` launcher from flat plugin-store installs when package resolution fails, and include broker stderr when startup exits early. Thanks to Eduardo Marquez (`DocksDocks`) for issue #97.
+- Preserve attachments when replying through `intercom({ action: "reply" })`. Thanks to Ruoshan Huang (`ruoshan`) for issue #99.
+
+## [0.10.0] - 2026-08-09
+
+### Added
+- Added cwd-scoped `send` and `ask` targeting plus `openProjectPaneIfMissing` for visible cross-codebase peer conversations through Herdr project panes.
+
+### Changed
+- Cleaned intercom tool copy, visible-peer skill guidance, and broker protocol validation structure.
+
+### Fixed
+- Surface malformed intercom config errors with path context instead of silently falling back to defaults.
+- Fail blocking `ask` and supervisor-decision requests immediately when the target is not connected instead of accepting a mailbox delivery that can wait until timeout.
+- Prevent disconnected mailbox routing from delivering a message back to its sender or transferring mail through runtime-only unnamed-session aliases. Thanks to ELA718 for PR #93.
+- Extend unnamed-session fallback aliases with enough session-ID characters to distinguish UUIDv7 sessions started close together.
+
+## [0.9.3] - 2026-08-08
+
+### Fixed
+- Allow replies to target pending asks by a unique sender session-ID prefix. Thanks to Benjamin Jesuiter (`bjesuiter`) for PR #85.
+- Detect half-open broker sockets and reconnect clients. Thanks to Nicolas Marchildon (`elecnix`) for issue #89 and PR #88.
+- Hand busy interactive inbound messages directly to Pi's safe steering queue instead of waiting for aggregate idle, preventing stale coordination from appearing hours after it was received. Thanks to Xiangzhe (`xz-dev`) for issue #86 and PR #87.
+- Treat a public send to the sole pending asker as its reply. Thanks to Grant Hutchins (`nertzy`) for PR #90.
+- Display session-ID prefixes that distinguish listed sessions. Thanks to Chris Goddard (`chrisgoddard`) for issue #83.
+
+## [0.9.2] - 2026-08-03
+
+### Fixed
+- Avoid relaunching standalone Pi executables as the Node runtime when starting the default broker process. Thanks to ZacharyQin for PR #82 and to jeffutter and awaae001 for confirming the impact.
+
+## [0.9.1] - 2026-07-30
+
+### Fixed
+- Scoped name-based queued-mail redelivery to sessions that also match the target's directory. A disconnected session's queued messages, including replies addressed to its exact session ID, could previously be delivered to an unrelated same-named session in a different project folder. Directories compare through the same normalization used by `list-cwd`, so a relaunch reporting the same directory via a trailing slash or symlink still receives its mail.
+
+### Changed
+- Rewrote the broker frame reader as a bounded state machine and made frame writes a single allocation, removing quadratic `Buffer.concat` accumulation on fragmented socket reads (up to ~28x faster on heavily fragmented frames).
+- Cached the collapsed preview and width-keyed wrapped body lines in the inline message renderer, cutting repeated rerender cost of long messages by ~2-3x while keeping live theme changes applied per render.
+
+## [0.9.0] - 2026-07-29
+
+### Added
+- Added a bounded in-memory broker mailbox so replies to recently disconnected named CLI senders are queued and delivered when a process reconnects with the same name. Thanks to Luke (`valkyriweb`) for issue #63.
+- Added protocol-visible delivery metadata, receiver lifecycle receipts, receiver-side inbound message dedupe, explicit cancel/supersede controls, and clearer ask-timeout receipts for ordered delivery diagnostics. Thanks to Donnie Thomas (`donnielrt`) for issue #65.
+
+## [0.8.0] - 2026-07-29
+
+### Added
+- Added opt-in restart-stable intercom session IDs via `PI_INTERCOM_STABLE_ID` or `stableId` in `config.json`. Thanks to iRonin for issue #39.
+- Added `/intercom-id` to insert a stable handoff snippet for the current session into the editor. Thanks to dataforxyz for PR #60.
+- Added `intercom({ action: "list-cwd" })` to list peers scoped to the same working directory. Thanks to iRonin for PR #58.
+- Added live context-window usage to session presence and list output. Thanks to iRonin for PR #59.
+- Added a silent namespaced extension bus for non-conversational extension coordination. Thanks to Kieran Bond for PR #69.
+
 ## [0.7.0] - 2026-07-29
 
 ### Changed

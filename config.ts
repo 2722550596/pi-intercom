@@ -2,7 +2,8 @@ import { existsSync, readFileSync } from "fs";
 import { join } from "path";
 import { getIntercomDirPath } from "./broker/paths.ts";
 
-export const DEFAULT_ASK_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_ASK_TIMEOUT_MS = 10 * 60 * 1000;
+const INTERCOM_SCOPE_ID_ENV = "PI_INTERCOM_SCOPE_ID";
 
 export function getAskTimeoutMs(): number {
   const raw = process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
@@ -15,6 +16,11 @@ export function getAskTimeoutMs(): number {
     throw new Error("PI_INTERCOM_ASK_TIMEOUT_MS must be a positive integer number of milliseconds");
   }
   return value;
+}
+
+export function getIntercomScopeId(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const scopeId = env[INTERCOM_SCOPE_ID_ENV]?.trim();
+  return scopeId ? scopeId : undefined;
 }
 
 export type InboundTriggerPolicy = "always" | "replies" | "never";
@@ -34,6 +40,9 @@ export interface IntercomConfig {
 
   /** Optional custom status suffix shown after automatic lifecycle status */
   status?: string;
+
+  /** Optional stable intercom session ID for restart-stable addressing */
+  stableId?: string;
   
   /** Enable/disable intercom (default: true) */
   enabled: boolean;
@@ -135,9 +144,20 @@ export function loadConfig(): IntercomConfig {
       config.status = parsedConfig.status;
     }
 
+    if (Object.hasOwn(parsedConfig, "stableId")) {
+      if (typeof parsedConfig.stableId !== "string") {
+        throw new Error(`"stableId" must be a string`);
+      }
+      const stableId = parsedConfig.stableId.trim();
+      if (!stableId) {
+        throw new Error(`"stableId" must not be empty`);
+      }
+      config.stableId = stableId;
+    }
+
     return config;
   } catch (error) {
-    console.error(`Failed to load intercom config at ${configPath}:`, error);
-    return { ...defaults, inboundTrigger: "never" };
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Failed to load intercom config at ${configPath}: ${message}`, { cause: error });
   }
 }

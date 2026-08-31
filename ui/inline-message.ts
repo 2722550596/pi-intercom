@@ -10,6 +10,10 @@ export class InlineMessageComponent implements Component {
   private replyCommand?: string;
   private bodyText?: string;
   private collapsed: boolean;
+  // Caches assume message/bodyText never mutate after construction; theme
+  // styling stays outside the caches so live theme changes apply per render.
+  private collapsedPreview?: string;
+  private wrappedBody?: { width: number; lines: string[] };
 
   constructor(
     from: SessionInfo,
@@ -38,7 +42,7 @@ export class InlineMessageComponent implements Component {
     }
     const bodyWidth = Math.max(1, width - 2);
 
-    const header = ` 📨 From: ${senderName} (${this.from.cwd}) `;
+    const header = ` From: ${senderName} (${this.from.cwd}) `;
     const headerText = truncateToWidth(this.collapsed ? `${header} Ctrl+O expands ` : header, bodyWidth, "");
     const headerPadding = Math.max(0, bodyWidth - visibleWidth(headerText));
     lines.push(
@@ -54,16 +58,17 @@ export class InlineMessageComponent implements Component {
     };
 
     if (this.collapsed) {
-      const preview = (this.bodyText || this.message.content.text).replace(/\s+/g, " ").trim();
-      lines.push(frameLine(this.theme.fg("text", preview)));
+      this.collapsedPreview ??= (this.bodyText || this.message.content.text).replace(/\s+/g, " ").trim();
+      lines.push(frameLine(this.theme.fg("text", this.collapsedPreview)));
 
       const meta: string[] = [];
-      if (this.replyCommand) meta.push(`↩ To reply: ${this.replyCommand}`);
+      if (this.replyCommand) meta.push(`To reply: ${this.replyCommand}`);
       if (this.message.content.attachments?.length) {
         const count = this.message.content.attachments.length;
-        meta.push(`📎 ${count} attachment${count === 1 ? "" : "s"}`);
+        meta.push(`${count} attachment${count === 1 ? "" : "s"}`);
       }
-      if (this.message.replyTo && !this.message.expectsReply) meta.push(`↳ Reply to ${this.message.replyTo.slice(0, 8)}`);
+      if (this.message.provenance?.type === "extension_outbox") meta.push(`Via ${this.message.provenance.extensionName}`);
+      if (this.message.replyTo && !this.message.expectsReply) meta.push(`Reply to ${this.message.replyTo.slice(0, 8)}`);
       meta.push("Ctrl+O to expand");
 
       lines.push(frameLine(this.theme.fg("dim", ` ${meta.join(" · ")}`)));
@@ -71,14 +76,19 @@ export class InlineMessageComponent implements Component {
       return lines;
     }
 
-    const contentLines = wrapTextWithAnsi(this.bodyText || this.message.content.text, bodyWidth);
-    for (const line of contentLines) {
+    if (this.wrappedBody?.width !== bodyWidth) {
+      this.wrappedBody = {
+        width: bodyWidth,
+        lines: wrapTextWithAnsi(this.bodyText || this.message.content.text, bodyWidth),
+      };
+    }
+    for (const line of this.wrappedBody.lines) {
       lines.push(frameLine(this.theme.fg("text", line)));
     }
 
     if (this.replyCommand) {
       lines.push(frameLine(""));
-      const replyLines = wrapTextWithAnsi(this.theme.fg("dim", ` ↩ To reply: ${this.replyCommand}`), bodyWidth);
+      const replyLines = wrapTextWithAnsi(this.theme.fg("dim", ` To reply: ${this.replyCommand}`), bodyWidth);
       for (const line of replyLines) {
         lines.push(frameLine(line));
       }
@@ -87,13 +97,18 @@ export class InlineMessageComponent implements Component {
     if (this.message.content.attachments?.length) {
       lines.push(frameLine(""));
       for (const att of this.message.content.attachments) {
-        lines.push(frameLine(this.theme.fg("dim", ` 📎 ${att.name}`)));
+        lines.push(frameLine(this.theme.fg("dim", ` Attachment: ${att.name}`)));
       }
     }
 
     if (this.message.replyTo && !this.message.expectsReply) {
       lines.push(frameLine(""));
-      lines.push(frameLine(this.theme.fg("dim", ` ↳ Reply to ${this.message.replyTo.slice(0, 8)}`)));
+      lines.push(frameLine(this.theme.fg("dim", ` Reply to ${this.message.replyTo.slice(0, 8)}`)));
+    }
+
+    if (this.message.provenance?.type === "extension_outbox") {
+      lines.push(frameLine(""));
+      lines.push(frameLine(this.theme.fg("dim", ` Via extension: ${this.message.provenance.extensionName}`)));
     }
 
     lines.push(this.theme.fg("muted", `╰${borderChar.repeat(bodyWidth)}╯`));
