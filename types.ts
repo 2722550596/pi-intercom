@@ -7,8 +7,6 @@ export interface SessionInfo {
   startedAt: number;
   lastActivity: number;
   status?: string;
-  peerUid?: number;
-  trustedLocal?: boolean;
 }
 
 export interface Message {
@@ -16,11 +14,16 @@ export interface Message {
   timestamp: number;
   replyTo?: string;
   expectsReply?: boolean;
+  /** If true, deliver this message as a real user message (sendUserMessage) instead of intercom notification */
+  deliverAsUser?: boolean;
+  /** If true, write to background JSON instead of triggering a turn. Coexists with deliverAsUser: false. */
+  background?: boolean;
   content: {
     text: string;
     attachments?: Attachment[];
   };
 }
+
 
 export interface Attachment {
   type: "file" | "snippet" | "context";
@@ -29,14 +32,11 @@ export interface Attachment {
   language?: string;
 }
 
-export type SessionRegistration = Omit<SessionInfo, "id" | "peerUid" | "trustedLocal">;
-
 export type ClientMessage =
-  | { type: "register"; session: SessionRegistration; sessionId?: string; stateId?: string }
+  | { type: "register"; session: Omit<SessionInfo, "id"> }
   | { type: "unregister" }
   | { type: "list"; requestId: string }
   | { type: "send"; to: string; message: Message }
-  | { type: "cancel_ask"; messageId: string }
   | { type: "presence"; name?: string; status?: string; model?: string };
 
 export type BrokerMessage =

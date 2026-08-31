@@ -1,56 +1,72 @@
-<p>
-  <img src="banner.png" alt="pi-intercom" width="1100">
-</p>
+[English](README.md) | [中文](README.zh.md)
 
-# Pi Intercom
+# Pi Intercom — RP Fork
 
-Direct 1:1 messaging between pi sessions on the same machine. Send context, findings, or requests from one session to another — whether you're driving the conversation or letting agents coordinate.
+**This fork is built for roleplay (RP):** run a character agent in one terminal,
+a game/story process in another, and let them communicate naturally.
+
+Key differences from upstream:
+- `/connect <name>` — duplex chat channel: once connected, both sides' messages
+  inject as real user input and responses auto-forward. No tools needed.
+- `send_message` tool — blocking (通话模式) and fire-and-forget (留言模式) support,
+  with `deliverAsUser` so the peer sees it as a genuine user message.
+- Removed `contact_supervisor` — this fork doesn't integrate with pi-subagents.
 
 ```text
-User flow: press Alt+M or run /intercom to pick a session and send a message
+User flow: /connect <character-name> → talk naturally → replies flow automatically
 ```
 
-## Why
+> Original at npm: `pi-intercom` v0.6.0 by [nicopreme](https://www.npmjs.com/~nicopreme) ([@nicobailon](https://github.com/nicobailon)). Original repository: https://github.com/nicobailon/pi-intercom
 
-Sometimes you're running multiple pi sessions — one researching, one executing, one reviewing. Pi-intercom lets you:
+## Why (RP Use Case)
 
-- **User-driven orchestration** — Send context or findings from your research session to your execution session
-- **Agent collaboration** — An agent can reach out to another session when it needs help or wants to share results
-- **Session awareness** — See what other pi sessions are running and their current status
+You're running multiple pi sessions for storytelling: a **character agent** that speaks
+in-character, and a **game/story process** that manages world state, NPCs, and plot.
+Pi-intercom lets you:
 
-Unlike pi-messenger (a shared chat room for multi-agent swarms), pi-intercom is for targeted 1:1 communication where you pick the recipient.
+- **Duplex character↔game channel** — connect them once with `/connect story`, then just
+  talk. The character's speech arrives as real user input to the game, and the game's
+  narration lands as real user input to the character.
+- **Agent-to-agent communication** — the game agent can `send_message` to the character
+  agent to push a scene, trigger a dialogue, or deliver a consequence.
+- **Session awareness** — see what other characters/story processes are running, check
+  if they're idle or thinking.
 
-Pi-intercom also integrates well with [pi-subagents](https://github.com/nicobailon/pi-subagents): delegated child agents get a child-only `contact_supervisor` tool when `pi-subagents` supplies bridge metadata. Use `reason: "need_decision"` for blocking clarification, `reason: "interview_request"` for multiple structured supervisor answers, and `reason: "progress_update"` for meaningful plan-changing updates. Normal sessions only see the regular `intercom` tool.
+Unlike pi-messenger (shared chat room for multi-agent swarms), pi-intercom is for
+targeted 1:1 communication where you pick the recipient.
 
 ## In One Minute
 
-Each pi session that has `pi-intercom` loaded and enabled connects to a tiny local broker over a local IPC transport. The broker keeps track of connected sessions and routes direct messages to the one you target by name or session ID. The extension gives you both a tool (`intercom`) and a small overlay UI (`/intercom` or `Alt+M`). Incoming messages are rendered inline inside the recipient session, can trigger a turn immediately by default, and are also stored in Pi session history as extension entries. If you want a stricter local trust posture, `inboundTrigger` can reduce or disable auto-triggering.
+Each pi session that has `pi-intercom` loaded and enabled connects to a tiny local broker over a local IPC transport. The broker keeps track of connected sessions and routes direct messages to the one you target by name or session ID. The extension gives you both a tool (`intercom`) and a small overlay UI (`/intercom` or `Alt+M`). Incoming messages are rendered inline inside the recipient session, can trigger a turn immediately, and are also stored in Pi session history as extension entries.
 
 ## Install
 
 ```bash
+```bash
+# Install original from npm:
 pi install npm:pi-intercom
+# Install this fork (requires gh auth):
+pi install git:github.com/2722550596/pi-intercom
 ```
 
 Then restart Pi. The extension auto-connects to the broker on startup and registers the bundled `pi-intercom` skill for common coordination patterns.
 
-**Recommended:** Add this snippet to your project's `AGENTS.md` to help agents understand when to coordinate across sessions:
+**Recommended:** Add this snippet to sessions that need to coordinate:
 
 ```xml
 <pi-intercom>
-Coordinate with other local pi sessions on related codebases. Use `/skill:pi-intercom` for patterns.
+Coordinate with other local RP sessions (character agents, game/story processes).
+Use `/skill:pi-intercom` for patterns.
 
-**When:** Same codebase (parallel work), reference codebase (consulting patterns), related repos (shared libraries).
-
-**Not when:** Unrelated codebases, trivial questions, or when you can proceed independently.
-
-**Principle:** Prefer `send` for notifications; `ask` only when blocked waiting for input.
+**When:** Character↔game chat, multi-character scenes, game events to character.
+**Not when:** Unrelated processes, trivial messages, or when you can proceed alone.
+**Principle:** Prefer `/connect` for sustained dialogue; `send_message` for push events.
 </pi-intercom>
 ```
 
 A session becomes intercom-connected when all of these are true:
 - the `pi-intercom` extension is installed and loaded in that session
-- `enabled` is not set to `false` in the intercom config file, which defaults to `~/.pi/agent/intercom/config.json`
+- `enabled` is not set to `false` in `~/.pi/agent/intercom/config.json`
 - the session has started or reloaded after the extension was installed
 - the local broker is running or can be auto-started
 
@@ -117,194 +133,208 @@ See auth.ts:142-156.
 
 The reply hint (enabled by default) points to `intercom({ action: "reply", ... })`, so recipients do not need raw sender or `replyTo` IDs. Idle recipients get a new turn immediately; busy interactive recipients receive the message once they go idle. Attachment content is included in the agent-visible body, and messages are rendered inline and stored in Pi session history.
 
-## Workflow: Planner-Worker Coordination
+## Workflow: Broadcast / Listen (One-Way Channels)
 
-The most natural use of pi-intercom is splitting a task between two sessions — one holds the big picture, the other does the hands-on work. When the worker hits an ambiguity ("should I optimize for readability or performance here?"), they ask without losing context.
+For scenarios where you want asymmetric communication — one session broadcasting
+output to one or more listeners without automatic replies:
+
+- `/cast <name>` — broadcast your output to another session. Your messages arrive
+  as intercom notifications (with sender info), so listeners can distinguish
+  multiple casters.
+- `/listen <name>` — receive another session's broadcast. You see their output as
+  intercom messages, and can reply via `intercom` or `send_message` tools.
+
+### Use Cases
+
+- **GM broadcasting to multiple characters** — the GM session casts to all player
+  character sessions. Each character receives world events as notifications and
+  can respond individually.
+- **Observer monitoring** — a session listens to a game session's output without
+  injecting messages back.
+- **Logging/aggregation** — a central session listens to multiple workers and
+  aggregates their output.
 
 ### Setup
 
-Open two terminals and start pi in each. Name them so they can find each other:
-
 ```
-# Terminal 1                    # Terminal 2
-/name planner                   /name worker
-```
+# Terminal 1 (caster)                # Terminal 2 (listener)
+/name gm                             /name player1
 
-Verify they see each other from either session:
-
-```typescript
-intercom({ action: "list" })
-// → • worker — ~/projects/api (claude-sonnet-4) [idle]
+/cast player1                        /listen gm
+# or equivalently:
+# (player1 runs /listen gm instead)
 ```
 
-### The Conversation
+Now:
 
-Here's how a typical exchange looks. The planner delegates with `send` (fire-and-forget). The worker uses `ask` for anything that needs a response — questions, discoveries, completion reports. `ask` sends the message and blocks until the planner replies, so the worker gets the answer as a tool result and continues in the same turn.
+- **Caster says something** → lands as an intercom notification in all listeners
+- **Listener wants to reply** → must use `intercom` or `send_message` tools
+- **One caster, many listeners** — cast to multiple sessions
+- **One listener, many casters** — listen to multiple sessions
 
-**Planner sends a task:**
-```typescript
-intercom({
-  action: "send",
-  to: "worker",
-  message: "Task-3: Add retry logic to API client. Key files: src/api/client.ts, src/api/types.ts. Ask if anything's unclear."
-})
-```
+### Commands
 
-**Worker hits an ambiguity — asks and waits:**
-```typescript
-intercom({
-  action: "ask",
-  to: "planner",
-  message: "Should retry apply to all endpoints or just idempotent ones? Also, max retry count and backoff strategy?"
-})
-// → Reply from planner: Only GET/PUT/DELETE — never POST. Max 3 retries, exponential backoff starting at 100ms.
-// Worker continues implementing with the answer, same turn, full context.
-```
+| Command | Description |
+|---------|-------------|
+| `/cast <name>` | Start broadcasting to a session |
+| `/stopcast [name]` | Stop broadcasting (to specific session or all) |
+| `/listen <name>` | Start listening to a session |
+| `/unlisten [name]` | Stop listening (to specific session or all) |
 
-**Worker finds something unexpected — escalates and waits:**
-```typescript
-intercom({
-  action: "ask",
-  to: "planner",
-  message: "Found: fetchWithTimeout swallows network errors. Fixing this changes the error shape. OK to proceed?"
-})
-// → Reply from planner: Yes, surface the error types. The current behavior is a bug.
-```
+## Workflow: Background Mode (Multi-Agent Narration)
 
-**Worker reports completion:**
-```typescript
-intercom({
-  action: "ask",
-  to: "planner",
-  message: "Task-3 done. Added RetryPolicy type, applied to GET/PUT/DELETE, surfaced NetworkError, 4 tests passing."
-})
-// → Reply from planner: Looks good. Move on to task-4.
-```
+For scenarios where you want **asynchronous communication** — one session broadcasting
+actions to a narrator without triggering a conversational turn:
 
-### Communication Patterns
+- `/cast <name> --background` — broadcast your output to another session, but messages
+  are written to a JSON queue file instead of triggering the recipient's turn.
+- `/listen <name> --background` — receive another session's broadcast in background mode.
+  Messages accumulate in a queue until the narrator's prompt preset reads them.
 
-| Pattern | Action | Why |
-|---------|--------|-----|
-| **Task Delegation** | Planner uses `send` | Fire-and-forget. Planner doesn't need to wait for an ack. |
-| **Clarification Request** | Worker uses `ask` | Worker needs the answer to proceed. Blocks until reply. |
-| **Discovery Escalation** | Worker uses `ask` | Worker needs approval before changing course. |
-| **Completion Report** | Worker uses `ask` | Planner might have follow-up instructions or the next task. |
+### Use Cases
 
-### Reply Hints
+- **Multi-agent RPG** — character agents broadcast their actions in the background;
+  the narrator session reads queued actions and weaves them into the story.
+- **Asynchronous logging** — worker sessions log events without interrupting the main process.
+- **Batched updates** — multiple casters send updates; the narrator processes them all at once.
 
-When `replyHint` is enabled (the default), incoming messages include the exact `intercom()` call to respond:
+### Setup (Multi-Agent RPG Example)
 
 ```
-**From planner** (~/projects/api)
+# Terminal 1 (narrator)              # Terminal 2 (character: alyssa)
+/name narrator                       /name alyssa
+/preset narrator                     /preset alyssa
+/listen alyssa --background          /cast narrator --background
+/listen leo --background
 
-To reply, use the intercom tool: intercom({ action: "reply", message: "..." })
-
-Only GET/PUT/DELETE — never POST. Max 3 retries with exponential backoff starting at 100ms.
+# Terminal 3 (character: leo)
+/name leo
+/preset leo
+/cast narrator --background
 ```
 
-This matters because the agent receiving the message doesn't need to reconstruct raw `to` and `replyTo` IDs — the hint is right there. Combined with idle-gated `triggerTurn` delivery, it enables real back-and-forth conversation without interrupting work in progress. If the reply happens later instead of in the triggered turn, `intercom({ action: "reply" })` falls back to the single unresolved inbound ask, and `intercom({ action: "pending" })` shows who is still waiting.
+Now:
 
-### `send` vs `ask`
+- **Character acts** → `send_message` to narrator → written to `background-queue.json`
+- **Narrator's turn** → `background-casts` slot reads queue, injects into prompt, clears file
+- **Narrator responds** → uses `send_message` to push scene descriptions to relevant characters
 
-`send` is fire-and-forget — the tool returns immediately after delivery. By default, it sends immediately even in interactive sessions. If you want an approval dialog before non-reply sends, set `confirmSend: true` in config. Replies that include `replyTo` still skip confirmation so reply-hint flows can continue without an extra approval step.
+### Commands
 
-`ask` sends the message and blocks until the recipient responds (10-minute timeout by default; set `PI_INTERCOM_ASK_TIMEOUT_MS` to a positive millisecond value to change it). The reply comes back as the tool result, so the agent continues in the same turn with full context. No confirmation dialog — if you're asking and waiting, the intent is clear.
+| Command | Description |
+|---------|-------------|
+| `/cast <name> --background` | Start broadcasting in background mode (queued) |
+| `/listen <name> --background` | Start listening in background mode (queued) |
+| `/stopcast [name]` | Stop broadcasting (shows if was background) |
+| `/unlisten [name]` | Stop listening (cleans up background tracking) |
+| `/read-casts` | Preview queued background messages without clearing |
+| `/clear-casts` | Manually clear the background message queue |
 
-`reply` is receiver-side sugar for replying to an inbound ask. In the turn triggered by an incoming intercom ask, `intercom({ action: "reply", message: "..." })` targets that exact sender and message automatically. If you reply later, it falls back to the single unresolved inbound ask. If multiple asks are pending, use `intercom({ action: "pending" })` to inspect them and then call `reply` with `to` to disambiguate.
+### Background Queue File
 
-The planner typically uses `send`. If you prefer manual approval for outgoing non-reply messages, turn on `confirmSend: true`. The worker uses `ask` for everything (no confirmation needed, gets answers inline), so it can operate autonomously either way.
+Messages are stored at `~/.pi/agent/intercom/background-queue.json`:
 
-## Workflow: Subagent-to-Supervisor Escalation
-
-This workflow requires [`pi-subagents`](https://github.com/nicobailon/pi-subagents) to be installed and to supply child bridge metadata. When `pi-subagents` spawns a delegated child with that metadata, the child session gets a subagent-only `contact_supervisor` tool in addition to the regular `intercom` tool. Normal sessions never see `contact_supervisor`.
-
-### When the Tool Appears
-
-`contact_supervisor` only registers when `pi-subagents` sets all of these environment variables:
-
-- `PI_SUBAGENT_ORCHESTRATOR_TARGET` — the supervisor session name or ID
-- `PI_SUBAGENT_RUN_ID` — the run identifier
-- `PI_SUBAGENT_CHILD_AGENT` — the agent type
-- `PI_SUBAGENT_CHILD_INDEX` — the child index within the run
-
-If any are missing, the session falls back to the regular `intercom` tool.
-
-### Three Reasons
-
-| Reason | Behavior | Use When |
-|--------|----------|----------|
-| `need_decision` | Sends an ask and blocks until the supervisor replies (10-minute timeout by default; configurable with `PI_INTERCOM_ASK_TIMEOUT_MS`) | The subagent is blocked, uncertain, needs approval, or faces a product/API/scope decision |
-| `interview_request` | Sends structured questions and blocks until the supervisor replies | The subagent needs multiple machine-readable answers from the supervisor in one exchange |
-| `progress_update` | Fire-and-forget update to the supervisor | Meaningful progress or unexpected discoveries that change the plan |
-
-Do not use `contact_supervisor` for routine completion handoffs. Return the final subagent result normally through `pi-subagents`.
-
-### Example: Blocked Subagent Asks for Guidance
-
-```typescript
-contact_supervisor({
-  reason: "need_decision",
-  message: "The auth service returns 403 instead of 401 for expired tokens. Should I treat 403 as a re-auth trigger or a hard failure?"
-})
-// → Reply from supervisor: Treat 403 as re-auth trigger. Update the token refresh logic.
-```
-
-### Example: Structured Supervisor Interview
-
-```typescript
-contact_supervisor({
-  reason: "interview_request",
-  message: "Please answer these before I continue the migration.",
-  interview: {
-    title: "API migration choices",
-    questions: [
-      { id: "api", type: "single", question: "Which API should I target?", options: ["Stable API", "Experimental API"] },
-      { id: "constraints", type: "text", question: "What constraints should I preserve?" }
-    ]
+```json
+[
+  {
+    "from": { "id": "abc123", "name": "leo" },
+    "text": "我冲进仓库，手电筒扫过四周——天哪，这里有一整排旧世界的电池！",
+    "timestamp": 1698765432000
   }
-})
-// → Reply from supervisor: { "responses": [{ "id": "api", "value": "Stable API" }, ...] }
+]
 ```
 
-### Example: Progress Update
+The `background-casts` slot (registered by the project extension) reads this file on each
+prompt render, formats it as `<background_casts>` XML, and clears it (one-shot behavior).
 
-```typescript
-contact_supervisor({
-  reason: "progress_update",
-  message: "Discovered the bug is in the retry wrapper, not the API client. Fixing the wrapper will also close issue #42."
-})
-// → Progress update sent to supervisor planner
-```
+### Integration with Prompt Presets
 
-### What the Supervisor Sees
-
-The supervisor receives a formatted message with run metadata:
-
-```
-**From subagent-worker-78f659a3-1**
-
-Subagent needs a supervisor decision.
-Run: 78f659a3
-Agent: worker
-Child index: 0
-
-Which API should I use?
-```
-
-Reply hints work the same as regular `intercom` ask/reply flows. The supervisor can reply with `intercom({ action: "reply", message: "..." })` and the subagent receives the answer as the tool result.
-
-For `interview_request`, the supervisor message includes the structured questions plus a fenced JSON answer example using this stable shape:
+To use background casts in a narrator preset (`.pi/prompt-presets/narrator.json`):
 
 ```json
 {
-  "responses": [
-    { "id": "api", "value": "Stable API" },
-    { "id": "constraints", "value": "Keep the public error shape unchanged." }
+  "schemaVersion": 1,
+  "id": "narrator",
+  "mode": "replace",
+  "items": [
+    { "kind": "block", "id": "system", "content": "你是叙述者..." },
+    { "kind": "slot", "slot": "background-casts" },
+    { "kind": "slot", "slot": "chat-history" }
   ]
 }
 ```
 
-The supervisor can reply with plain JSON or a fenced `json` block. If the reply matches the `{ "responses": [...] }` shape and references valid question ids/options, the child tool result includes it in `details.structuredReply` while still showing the raw reply text.
+The `background-casts` slot is registered by the project extension at
+`.pi/extensions/background-casts.ts`. Place it in your project's `.pi/extensions/`
+directory for auto-loading.
+
+
+The most natural RP setup: connect a character agent to a game/story process via
+`/connect`, then both sides talk like normal users. No tool calls needed, no
+manual message routing.
+
+### Setup
+
+Open two terminals and name them:
+
+```
+# Terminal 1 (game/story server)    # Terminal 2 (character agent)
+/name story                          /name lian
+```
+
+From either terminal, connect:
+
+```
+/connect story     # from character terminal
+# or
+/connect lian      # from game terminal
+```
+
+Now everything flows automatically:
+
+- **Character says something** → lands as user input in the game session
+- **Game narrates back** → lands as user input in the character session
+- **No tools, no `/intercom`** — just talk normally.
+
+### Manual Communication (No /connect)
+
+If you prefer one-off messages without establishing a duplex channel, use the tools:
+
+**Send a message and wait for reply (通话模式):**
+
+```typescript
+send_message({
+  to: "story",
+  message: "I cautiously open the creaky door..."
+})
+// → Blocks until the game session replies with what's behind it
+```
+
+**Fire-and-forget (留言模式):**
+
+```typescript
+send_message({
+  to: "lian",
+  message: "You hear footsteps approaching from the corridor.",
+  blocking: false
+})
+// → Returns immediately; the message arrives as a new user message to the character
+```
+
+### Receiving Messages
+
+When a message arrives from the other session:
+
+- If connected via `/connect`: it injects as a real user message — the agent
+  responds naturally as part of its thinking loop.
+- If using tools: the message appears inline with sender info and a reply hint.
+
+### Quick Status
+
+```typescript
+intercom({ action: "list" })
+// → Shows all connected sessions with names, cwd, and live status
+```
 
 ## Tool Reference
 
@@ -318,21 +348,7 @@ The supervisor can reply with plain JSON or a fenced `json` block. If the reply 
 | `attachments` | array | Optional `file`, `snippet`, or `context` attachments |
 | `replyTo` | string | Optional message ID for threading or replying to an `ask` |
 
-### contact_supervisor
-
-Only registered in sessions where `pi-subagents` supplied the required child bridge metadata. Contacts the supervisor session that delegated the current task.
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `reason` | string | `"need_decision"` (blocking), `"interview_request"` (blocking structured questions), or `"progress_update"` (fire-and-forget) |
-| `message` | string | The decision request, optional interview note, or progress update |
-| `interview` | object | Required for `interview_request`: `{ title?, description?, questions: [...] }` |
-
-**`need_decision`** — Sends a formatted ask to the supervisor and blocks until it replies (10-minute timeout by default; configurable with `PI_INTERCOM_ASK_TIMEOUT_MS`). The reply comes back as the tool result. Includes run metadata in the message so the supervisor knows which subagent is asking.
-
-**`interview_request`** — Sends a formatted, agent-readable interview to the supervisor and blocks until it replies. Questions use a local pi-interview-like shape: `{ id, type, question, options?, context? }` where `type` is `single`, `multi`, `text`, `image`, or `info`. `info` questions are context-only and do not need responses. The supervisor reply should be JSON with `{ "responses": [{ "id": "...", "value": ... }] }`. Parsed JSON replies are returned in `details.structuredReply`.
-
-**`progress_update`** — Sends a non-blocking update to the supervisor. Returns immediately after delivery. Use only for meaningful progress or unexpected discoveries that change the plan.
+### intercom actions
 
 ### intercom actions
 
@@ -340,7 +356,7 @@ Only registered in sessions where `pi-subagents` supplied the required child bri
 
 **`send`** — Sends a message to the specified session. By default it sends immediately, including in interactive sessions. Set `confirmSend: true` in config if you want a confirmation dialog for non-reply sends. Replies that include `replyTo` skip confirmation. Returns delivery confirmation.
 
-**`ask`** — Sends a message and waits for the recipient to reply (10-minute timeout by default; configurable with `PI_INTERCOM_ASK_TIMEOUT_MS`). The reply is returned as the tool result. No confirmation dialog. Only one pending `ask` is allowed per session at a time. Use this when the agent needs the answer to continue working.
+**`ask`** — Sends a message and waits for the recipient to reply (10-minute timeout). The reply is returned as the tool result. No confirmation dialog. Only one pending `ask` is allowed per session at a time. Use this when the agent needs the answer to continue working.
 
 **`reply`** — Replies to the current intercom-triggered message if there is one. Otherwise it falls back to the single unresolved inbound ask. If multiple asks are pending, pass `to` or inspect them with `pending` first. Under the hood this is still a normal `send` with the exact `replyTo` value.
 
@@ -366,7 +382,6 @@ Create `~/.pi/agent/intercom/config.json`:
   "brokerCommand": "npx",
   "brokerArgs": ["--no-install", "tsx"],
   "confirmSend": false,
-  "inboundTrigger": "always",
   "enabled": true,
   "replyHint": true,
   "status": "researching"
@@ -375,17 +390,14 @@ Create `~/.pi/agent/intercom/config.json`:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `brokerCommand` | `"npx"` | Advanced trusted override for the broker executable. The default value is hardened internally to launch the resolved bundled `tsx` CLI through the current Node executable instead of resolving `npx` through `PATH`. |
-| `brokerArgs` | `["--no-install", "tsx"]` | Advanced trusted arguments passed to custom `brokerCommand` before the broker script path |
+| `brokerCommand` | `"npx"` | Command used to start the local broker process |
+| `brokerArgs` | `["--no-install", "tsx"]` | Arguments passed to `brokerCommand` before the broker script path |
 | `confirmSend` | false | Show a confirmation dialog before non-reply sends from an interactive session with UI |
-| `inboundTrigger` | `"always"` | Auto-trigger policy for inbound broker messages: `"always"`, `"replies"`, or `"never"`. Local in-process subagent relay events still trigger the addressed session. |
 | `enabled` | true | Enable/disable intercom entirely |
 | `replyHint` | true | Include reply instruction in incoming messages |
 | `status` | — | Optional custom status suffix shown after the automatic lifecycle status, for example `thinking · researching` |
 
-If `config.json` cannot be parsed or contains an invalid value, pi-intercom logs the error and fails closed for inbound broker auto-triggering by using `inboundTrigger: "never"` until the config is fixed.
-
-Custom broker commands are trusted local configuration: anyone who can edit this config can choose the executable used for future broker auto-spawns. For example, if you have Bun installed and want it to start the broker directly, use:
+For example, if you have Bun installed and want it to start the broker directly, use:
 
 ```json
 {
@@ -395,8 +407,6 @@ Custom broker commands are trusted local configuration: anyone who can edit this
 ```
 
 Pi-intercom publishes live session status automatically. Sessions register as `idle`, switch to `thinking` while the agent is running, show `tool:<name>` during tool execution, and return to `idle` on agent completion. If `status` is set in config, it is appended as context instead of replacing the lifecycle status.
-
-By default, runtime state and config live under `~/.pi/agent/intercom`. If Pi is launched with `PI_CODING_AGENT_DIR`, pi-intercom uses `$PI_CODING_AGENT_DIR/intercom` instead, including `config.json`, broker PID/lock files, sockets, and launcher state.
 
 ## How It Works
 
@@ -426,23 +436,19 @@ graph TB
 
 The broker is a standalone TypeScript process that manages session registration and message routing. It auto-spawns when the first intercom-enabled session needs it and exits after 5 seconds when the last connected session disconnects. Clients now reconnect automatically if the broker disappears and later comes back.
 
-Messages use length-prefixed JSON over a local socket/pipe transport (4-byte length + JSON payload) to handle fragmentation properly. The protocol includes request correlation for session listing, explicit delivery failures, validation for malformed or out-of-order messages, a frame-size cap, per-connection local rate limiting, and no-op presence coalescing.
-
-Session IDs are the trusted addressing key. Duplicate names remain allowed for same-user workflows, but sends to ambiguous names fail and users should target the stable session ID shown by `list`/`status` in trust-sensitive flows. The broker owns local trust metadata such as `trustedLocal`; `peerUid` is reserved for runtimes that can expose real peer credentials and is left unset otherwise. Client-supplied cwd/model/pid/status are display metadata, not authentication.
+Messages use length-prefixed JSON over a local socket/pipe transport (4-byte length + JSON payload) to handle fragmentation properly. The protocol includes request correlation for session listing, explicit delivery failures, and validation for malformed or out-of-order messages.
 
 Async extension work (startup, inbound flushes, reconnects, overlays, and relays) no-ops if the session shuts down or reloads before it settles.
 
-Runtime files live at `~/.pi/agent/intercom/` by default, or `$PI_CODING_AGENT_DIR/intercom/` when `PI_CODING_AGENT_DIR` is set:
+Runtime files live at `~/.pi/agent/intercom/`:
 - `broker.sock` — Unix domain socket for communication (macOS/Linux only; Windows uses a named pipe instead)
 - `broker-launch.vbs` — Windows helper script used to launch the broker without a console window
 - `broker.pid` — Broker process ID
-- `broker.spawn.lock` — Auto-spawn lock file
-- `broker.port.json` — Dynamic localhost TCP endpoint, only when Windows TCP transport is explicitly enabled
 - `config.json` — User configuration
 
 ## Design Decisions
 
-**Local IPC instead of TCP.** Same-machine only by design. `pi-intercom` uses Unix sockets on macOS/Linux and a named pipe on Windows, which keeps setup simple and avoids port management. Windows TCP is available only as an explicit escape hatch with `PI_INTERCOM_TRANSPORT=tcp` (or `PI_INTERCOM_TCP=1`) for environments where named pipes are blocked. In that mode the broker binds a dynamic `127.0.0.1` port, records the endpoint plus a local secret under the intercom state dir, and requires that secret before health or registration succeeds. Health replies do not echo the secret, so a random localhost process cannot discover it through the broker protocol.
+**Local IPC instead of TCP.** Same-machine only by design. `pi-intercom` uses Unix sockets on macOS/Linux and a named pipe on Windows, which keeps setup simple and avoids port management.
 
 **Auto-spawn with file lock.** The broker starts on first connection and exits after 5 seconds idle. There is no daemon to manage. A spawn lock file, keyed by PID and timestamp, prevents duplicate brokers when multiple sessions start at once.
 

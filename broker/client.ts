@@ -1,15 +1,20 @@
 import { EventEmitter } from "events";
 import net from "net";
 import { randomUUID } from "crypto";
-import { writeMessage, createMessageReader } from "./framing.ts";
-import { getBrokerConnectTarget, type BrokerConnectTarget } from "./paths.ts";
-import type { SessionInfo, Message, Attachment, SessionRegistration } from "../types.ts";
+import { writeMessage, createMessageReader } from "./framing.js";
+import { getBrokerSocketPath } from "./paths.js";
+import type { SessionInfo, Message, Attachment } from "../types.js";
+
+const BROKER_SOCKET = getBrokerSocketPath();
 
 interface SendOptions {
   text: string;
   attachments?: Attachment[];
   replyTo?: string;
   expectsReply?: boolean;
+  deliverAsUser?: boolean;
+  /** If true, write to background JSON instead of triggering a turn */
+  background?: boolean;
   messageId?: string;
 }
 
@@ -21,12 +26,6 @@ interface SendResult {
 
 function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
-}
-
-function connectToBrokerTarget(target: BrokerConnectTarget): net.Socket {
-  return typeof target === "string"
-    ? net.connect(target)
-    : net.connect({ host: target.host, port: target.port });
 }
 
 function isAttachment(value: unknown): value is Attachment {
@@ -70,6 +69,10 @@ function isMessage(value: unknown): value is Message {
     return false;
   }
 
+  if (message.deliverAsUser !== undefined && typeof message.deliverAsUser !== "boolean") {
+    return false;
+  }
+
   if (typeof message.content !== "object" || message.content === null) {
     return false;
   }
@@ -105,15 +108,7 @@ function isSessionInfo(value: unknown): value is SessionInfo {
     return false;
   }
 
-  if (session.status !== undefined && typeof session.status !== "string") {
-    return false;
-  }
-
-  if (session.peerUid !== undefined && typeof session.peerUid !== "number") {
-    return false;
-  }
-
-  return session.trustedLocal === undefined || typeof session.trustedLocal === "boolean";
+  return session.status === undefined || typeof session.status === "string";
 }
 
 export class IntercomClient extends EventEmitter {
@@ -161,21 +156,13 @@ export class IntercomClient extends EventEmitter {
     return socket;
   }
 
-  connect(session: SessionRegistration, sessionId?: string): Promise<void> {
+  connect(session: Omit<SessionInfo, "id">): Promise<void> {
     if (this.socket) {
       return Promise.reject(new Error("Already connected"));
     }
 
     return new Promise((resolve, reject) => {
-      let socket: net.Socket;
-      let target: BrokerConnectTarget;
-      try {
-        target = getBrokerConnectTarget();
-        socket = connectToBrokerTarget(target);
-      } catch (error) {
-        reject(toError(error));
-        return;
-      }
+      const socket = net.connect(BROKER_SOCKET);
       this.socket = socket;
       this.disconnectError = null;
       let settled = false;
@@ -274,12 +261,7 @@ export class IntercomClient extends EventEmitter {
       this.once("_registered", onRegistered);
       
       try {
-        writeMessage(socket, {
-          type: "register",
-          session,
-          ...(sessionId ? { sessionId } : {}),
-          ...(typeof target === "string" ? {} : { stateId: target.stateId }),
-        });
+        writeMessage(socket, { type: "register", session });
       } catch (error) {
         cleanupConnectionAttempt();
         cleanupSocketListeners();
@@ -299,7 +281,7 @@ export class IntercomClient extends EventEmitter {
 
     const brokerMessage = msg as { type: string } & Record<string, unknown>;
 
-    if (this._sessionId === null && brokerMessage.type !== "registered" && brokerMessage.type !== "error") {
+    if (this._sessionId === null && brokerMessage.type !== "registered") {
       throw new Error(`Received ${brokerMessage.type} before registered`);
     }
 
@@ -411,9 +393,6 @@ export class IntercomClient extends EventEmitter {
           throw new Error("Invalid error message");
         }
 
-        if (this._sessionId === null) {
-          throw new Error(brokerMessage.error);
-        }
         this.emit("error", new Error(brokerMessage.error));
         break;
       }
@@ -508,13 +487,14 @@ export class IntercomClient extends EventEmitter {
     } catch (error) {
       return Promise.reject(toError(error));
     }
-    
     const messageId = options.messageId ?? randomUUID();
     const message: Message = {
       id: messageId,
       timestamp: Date.now(),
       replyTo: options.replyTo,
       expectsReply: options.expectsReply,
+      deliverAsUser: options.deliverAsUser,
+      background: options.background,
       content: {
         text: options.text,
         attachments: options.attachments,
@@ -546,23 +526,6 @@ export class IntercomClient extends EventEmitter {
         reject(toError(error));
       }
     });
-  }
-
-  cancelAsk(messageId: string): void {
-    if (this.disconnecting) {
-      return;
-    }
-
-    const socket = this.socket;
-    if (!socket || !this._sessionId || socket.destroyed || socket.writableEnded || !socket.writable) {
-      return;
-    }
-
-    try {
-      writeMessage(socket, { type: "cancel_ask", messageId });
-    } catch {
-      // Cancellation is best-effort; local waiter cleanup must still proceed.
-    }
   }
 
   updatePresence(updates: { name?: string; status?: string; model?: string }): void {

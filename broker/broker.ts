@@ -1,50 +1,19 @@
 import net from "net";
-import { writeFileSync, unlinkSync } from "fs";
+import { writeFileSync, unlinkSync, mkdirSync } from "fs";
 import { join } from "path";
+import { homedir } from "os";
 import { randomUUID } from "crypto";
-import { writeMessage, createMessageReader } from "./framing.ts";
-import {
-  ensureIntercomRuntimeDir,
-  getBrokerListenTarget,
-  getBrokerPortFilePath,
-  getIntercomDirPath,
-  INTERCOM_PROTOCOL_NAME,
-  INTERCOM_PROTOCOL_VERSION,
-  INTERCOM_RUNTIME_FILE_MODE,
-  restrictIntercomRuntimeFile,
-  type BrokerConnectTarget,
-} from "./paths.ts";
-import { getAskTimeoutMs } from "../config.ts";
-import type { SessionInfo, Message, Attachment, BrokerMessage, SessionRegistration } from "../types.ts";
+import { writeMessage, createMessageReader } from "./framing.js";
+import { getBrokerSocketPath } from "./paths.js";
+import type { SessionInfo, Message, Attachment, BrokerMessage } from "../types.js";
 
-const INTERCOM_DIR = getIntercomDirPath();
-const LISTEN_TARGET = getBrokerListenTarget();
+const INTERCOM_DIR = join(homedir(), ".pi/agent/intercom");
+const SOCKET_PATH = getBrokerSocketPath();
 const PID_PATH = join(INTERCOM_DIR, "broker.pid");
-const PORT_PATH = getBrokerPortFilePath(INTERCOM_DIR);
-const BROKER_STATE_ID = randomUUID();
-const MAX_SESSIONS = 128;
-const MAX_UNREGISTERED_CONNECTIONS = 32;
-const REGISTRATION_TIMEOUT_MS = 1000;
-const RATE_LIMIT_CAPACITY = 240;
-const RATE_LIMIT_REFILL_PER_SECOND = 120;
-const PRESENCE_HEARTBEAT_MS = 1000;
 
 interface ConnectedSession {
   socket: net.Socket;
   info: SessionInfo;
-  lastPresenceBroadcastAt: number;
-}
-
-interface ConnectionState {
-  socket: net.Socket;
-  tokens: number;
-  lastRefillAt: number;
-}
-
-interface AskEdge {
-  from: string;
-  to: string;
-  createdAt: number;
 }
 
 function isAttachment(value: unknown): value is Attachment {
@@ -88,6 +57,10 @@ function isMessage(value: unknown): value is Message {
     return false;
   }
 
+  if (message.deliverAsUser !== undefined && typeof message.deliverAsUser !== "boolean") {
+    return false;
+  }
+
   if (typeof message.content !== "object" || message.content === null) {
     return false;
   }
@@ -101,11 +74,7 @@ function isMessage(value: unknown): value is Message {
     || (Array.isArray(content.attachments) && content.attachments.every(isAttachment));
 }
 
-function isSessionId(value: unknown): value is string {
-  return typeof value === "string" && value.trim().length > 0;
-}
-
-function isSessionRegistration(value: unknown): value is SessionRegistration {
+function isSessionRegistration(value: unknown): value is Omit<SessionInfo, "id"> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return false;
   }
@@ -131,18 +100,14 @@ function isSessionRegistration(value: unknown): value is SessionRegistration {
 
 class IntercomBroker {
   private sessions = new Map<string, ConnectedSession>();
-  private askEdges = new Map<string, AskEdge>();
-  private connections = new Set<net.Socket>();
-  private unregisteredConnections = new Set<net.Socket>();
   private server: net.Server;
   private shutdownTimer: NodeJS.Timeout | null = null;
-  private readonly askTimeoutMs = getAskTimeoutMs();
 
   constructor() {
-    ensureIntercomRuntimeDir(INTERCOM_DIR);
-    if (typeof LISTEN_TARGET === "string" && process.platform !== "win32") {
+    mkdirSync(INTERCOM_DIR, { recursive: true });
+    if (process.platform !== "win32") {
       try {
-        unlinkSync(LISTEN_TARGET);
+        unlinkSync(SOCKET_PATH);
       } catch {
         // A clean startup has no stale socket to remove.
       }
@@ -151,82 +116,20 @@ class IntercomBroker {
   }
 
   start(): void {
-    const onListening = () => {
-      if (typeof LISTEN_TARGET === "string") {
-        restrictIntercomRuntimeFile(LISTEN_TARGET);
-      } else {
-        const address = this.server.address();
-        if (!address || typeof address === "string") {
-          throw new Error("Intercom TCP broker started without a TCP address");
-        }
-        const endpoint: BrokerConnectTarget = {
-          transport: "tcp",
-          host: LISTEN_TARGET.host,
-          port: address.port,
-          stateId: BROKER_STATE_ID,
-        };
-        writeFileSync(PORT_PATH, `${JSON.stringify(endpoint)}\n`, { mode: INTERCOM_RUNTIME_FILE_MODE });
-        restrictIntercomRuntimeFile(PORT_PATH);
-      }
-      writeFileSync(PID_PATH, String(process.pid), { mode: INTERCOM_RUNTIME_FILE_MODE });
-      restrictIntercomRuntimeFile(PID_PATH);
+    this.server.listen(SOCKET_PATH, () => {
+      writeFileSync(PID_PATH, String(process.pid));
       console.log(`Intercom broker started (pid: ${process.pid})`);
-    };
-
-    if (typeof LISTEN_TARGET === "string") {
-      this.server.listen(LISTEN_TARGET, onListening);
-    } else {
-      this.server.listen({ host: LISTEN_TARGET.host, port: LISTEN_TARGET.port }, onListening);
-    }
+    });
     process.on("SIGTERM", () => this.shutdown());
     process.on("SIGINT", () => this.shutdown());
   }
 
   private handleConnection(socket: net.Socket): void {
-    this.connections.add(socket);
     let sessionId: string | null = null;
-    let registrationTimeout: NodeJS.Timeout | null = null;
-    const armRegistrationTimeout = () => {
-      if (registrationTimeout) {
-        clearTimeout(registrationTimeout);
-      }
-      this.unregisteredConnections.delete(socket);
-      this.unregisteredConnections.add(socket);
-      this.evictOldestUnregisteredConnections(socket);
-      registrationTimeout = setTimeout(() => {
-        if (!sessionId) {
-          socket.destroy();
-        }
-      }, REGISTRATION_TIMEOUT_MS);
-      registrationTimeout.unref?.();
-    };
-    const clearRegistrationTimeout = () => {
-      if (registrationTimeout) {
-        clearTimeout(registrationTimeout);
-        registrationTimeout = null;
-      }
-      this.unregisteredConnections.delete(socket);
-    };
-    armRegistrationTimeout();
-    const connection: ConnectionState = {
-      socket,
-      tokens: RATE_LIMIT_CAPACITY,
-      lastRefillAt: Date.now(),
-    };
 
     const reader = createMessageReader((msg) => {
-      if (!this.consumeToken(connection)) {
-        writeMessage(socket, { type: "error", error: "Intercom broker rate limit exceeded" });
-        socket.destroy(new Error("Intercom broker rate limit exceeded"));
-        return;
-      }
       this.handleMessage(socket, msg, sessionId, (id) => {
         sessionId = id;
-        if (id) {
-          clearRegistrationTimeout();
-        } else {
-          armRegistrationTimeout();
-        }
       });
     }, (error) => {
       socket.destroy(error);
@@ -235,52 +138,17 @@ class IntercomBroker {
     socket.on("data", reader);
 
     socket.on("close", () => {
-      clearRegistrationTimeout();
-      this.connections.delete(socket);
       if (sessionId) {
-        const existing = this.sessions.get(sessionId);
-        if (existing?.socket === socket) {
-          this.sessions.delete(sessionId);
-          this.clearAskEdgesForSession(sessionId);
-          this.broadcast({ type: "session_left", sessionId }, sessionId);
-          this.scheduleShutdownCheck();
-        }
+        this.sessions.delete(sessionId);
+        this.broadcast({ type: "session_left", sessionId }, sessionId);
+
+        this.scheduleShutdownCheck();
       }
     });
 
     socket.on("error", (error) => {
       console.error("Socket error:", error);
     });
-  }
-
-  private evictOldestUnregisteredConnections(currentSocket: net.Socket): void {
-    while (this.unregisteredConnections.size > MAX_UNREGISTERED_CONNECTIONS) {
-      const [oldest] = this.unregisteredConnections;
-      if (!oldest) {
-        return;
-      }
-      if (oldest === currentSocket && this.unregisteredConnections.size === 1) {
-        return;
-      }
-      this.unregisteredConnections.delete(oldest);
-      oldest.destroy();
-    }
-  }
-
-  private consumeToken(connection: ConnectionState, now = Date.now()): boolean {
-    const elapsedMs = now - connection.lastRefillAt;
-    if (elapsedMs > 0) {
-      connection.tokens = Math.min(
-        RATE_LIMIT_CAPACITY,
-        connection.tokens + elapsedMs * RATE_LIMIT_REFILL_PER_SECOND / 1000,
-      );
-      connection.lastRefillAt = now;
-    }
-    if (connection.tokens < 1) {
-      return false;
-    }
-    connection.tokens -= 1;
-    return true;
   }
 
   private scheduleShutdownCheck(): void {
@@ -306,28 +174,6 @@ class IntercomBroker {
     }
 
     const clientMessage = msg as { type: string } & Record<string, unknown>;
-    const requiresEndpointAuth = typeof LISTEN_TARGET !== "string";
-    const hasEndpointAuth = clientMessage.stateId === BROKER_STATE_ID;
-
-    if (clientMessage.type === "health") {
-      if (typeof clientMessage.requestId !== "string") {
-        throw new Error("Invalid health message");
-      }
-      if (requiresEndpointAuth && !hasEndpointAuth) {
-        throw new Error("Invalid intercom TCP endpoint credentials");
-      }
-      writeMessage(socket, {
-        type: "health_ok",
-        requestId: clientMessage.requestId,
-        protocol: INTERCOM_PROTOCOL_NAME,
-        version: INTERCOM_PROTOCOL_VERSION,
-      });
-      return;
-    }
-
-    if (requiresEndpointAuth && clientMessage.type === "register" && !hasEndpointAuth) {
-      throw new Error("Invalid intercom TCP endpoint credentials");
-    }
 
     if (currentId === null && clientMessage.type !== "register") {
       throw new Error(`Received ${clientMessage.type} before register`);
@@ -343,37 +189,10 @@ class IntercomBroker {
           throw new Error("Received duplicate register message");
         }
         
-        let id: string = randomUUID();
-        if (clientMessage.sessionId !== undefined) {
-          if (!isSessionId(clientMessage.sessionId)) {
-            throw new Error("Invalid register sessionId");
-          }
-          id = clientMessage.sessionId;
-        }
-        const previous = this.sessions.get(id);
-        if (!previous && this.sessions.size >= MAX_SESSIONS) {
-          writeMessage(socket, { type: "error", error: "Too many registered intercom sessions" });
-          socket.destroy();
-          break;
-        }
-        if (previous) {
-          this.clearAskEdgesForSession(id);
-          previous.socket.end();
-        }
+        const id = randomUUID();
         setId(id);
-        const session = clientMessage.session;
-        const info: SessionInfo = {
-          id,
-          ...(session.name !== undefined ? { name: session.name } : {}),
-          cwd: session.cwd,
-          model: session.model,
-          pid: session.pid,
-          startedAt: session.startedAt,
-          lastActivity: session.lastActivity,
-          ...(session.status !== undefined ? { status: session.status } : {}),
-          trustedLocal: typeof LISTEN_TARGET === "string" && process.platform !== "win32",
-        };
-        this.sessions.set(id, { socket, info, lastPresenceBroadcastAt: Date.now() });
+        const info: SessionInfo = { ...clientMessage.session, id };
+        this.sessions.set(id, { socket, info });
         
         if (this.shutdownTimer) {
           clearTimeout(this.shutdownTimer);
@@ -386,17 +205,10 @@ class IntercomBroker {
       }
 
       case "unregister": {
-        if (!currentId) {
-          throw new Error("Received unregister before register");
-        }
-        const existing = this.sessions.get(currentId);
-        if (existing?.socket === socket) {
-          this.sessions.delete(currentId);
-          this.clearAskEdgesForSession(currentId);
-          this.broadcast({ type: "session_left", sessionId: currentId }, currentId);
-          this.scheduleShutdownCheck();
-        }
+        this.sessions.delete(currentId);
+        this.broadcast({ type: "session_left", sessionId: currentId }, currentId);
         setId(null);
+        this.scheduleShutdownCheck();
         break;
       }
 
@@ -411,9 +223,6 @@ class IntercomBroker {
       }
 
       case "send": {
-        if (!currentId) {
-          throw new Error("Received send before register");
-        }
         const message = clientMessage.message;
         const messageId = isMessage(message) ? message.id : "unknown";
 
@@ -426,21 +235,10 @@ class IntercomBroker {
           break;
         }
 
-        this.pruneAskEdges();
-        const replyEdge = message.replyTo ? this.askEdges.get(message.replyTo) : undefined;
-
         const targets = this.findSessions(clientMessage.to);
         if (targets.length === 1) {
-          if (message.replyTo && !replyEdge) {
-            writeMessage(socket, {
-              type: "delivery_failed",
-              messageId: message.id,
-              reason: "Reply target does not match a pending ask",
-            });
-            break;
-          }
           const fromSession = this.sessions.get(currentId);
-          if (!fromSession || fromSession.socket !== socket) {
+          if (!fromSession) {
             writeMessage(socket, {
               type: "delivery_failed",
               messageId: message.id,
@@ -448,35 +246,11 @@ class IntercomBroker {
             });
             break;
           }
-          const target = targets[0];
-          if (replyEdge && (replyEdge.to !== currentId || replyEdge.from !== target.info.id)) {
-            writeMessage(socket, {
-              type: "delivery_failed",
-              messageId: message.id,
-              reason: "Reply target does not match the pending ask",
-            });
-            break;
-          }
-          if (message.expectsReply) {
-            const reverseEdge = Array.from(this.askEdges.entries()).find(([edgeMessageId, edge]) => edgeMessageId !== message.replyTo && edge.from === target.info.id && edge.to === currentId);
-            if (reverseEdge) {
-              writeMessage(socket, {
-                type: "delivery_failed",
-                messageId: message.id,
-                reason: "Mutual ask refused: target session is already waiting for a reply from this session.",
-              });
-              break;
-            }
-            this.askEdges.set(message.id, { from: currentId, to: target.info.id, createdAt: Date.now() });
-          }
-          writeMessage(target.socket, {
+          writeMessage(targets[0].socket, {
             type: "message",
             from: fromSession.info,
             message,
           });
-          if (message.replyTo) {
-            this.askEdges.delete(message.replyTo);
-          }
           writeMessage(socket, { type: "delivered", messageId: message.id });
           break;
         }
@@ -498,83 +272,35 @@ class IntercomBroker {
         break;
       }
 
-      case "cancel_ask": {
-        if (!currentId) {
-          throw new Error("Received cancel_ask before register");
-        }
-        if (typeof clientMessage.messageId !== "string") {
-          throw new Error("Invalid cancel_ask message");
-        }
-        const session = this.sessions.get(currentId);
-        const edge = this.askEdges.get(clientMessage.messageId);
-        if (session?.socket === socket && edge?.from === currentId) {
-          this.askEdges.delete(clientMessage.messageId);
-        }
-        break;
-      }
-
       case "presence": {
-        if (!currentId) {
-          throw new Error("Received presence before register");
-        }
         const session = this.sessions.get(currentId);
-        if (session?.socket === socket) {
-          let changed = false;
+        if (session) {
           if (clientMessage.name !== undefined) {
             if (typeof clientMessage.name !== "string") {
               throw new Error("Invalid presence name");
             }
-            if (session.info.name !== clientMessage.name) {
-              session.info.name = clientMessage.name;
-              changed = true;
-            }
+            session.info.name = clientMessage.name;
           }
           if (clientMessage.status !== undefined) {
             if (typeof clientMessage.status !== "string") {
               throw new Error("Invalid presence status");
             }
-            if (session.info.status !== clientMessage.status) {
-              session.info.status = clientMessage.status;
-              changed = true;
-            }
+            session.info.status = clientMessage.status;
           }
           if (clientMessage.model !== undefined) {
             if (typeof clientMessage.model !== "string") {
               throw new Error("Invalid presence model");
             }
-            if (session.info.model !== clientMessage.model) {
-              session.info.model = clientMessage.model;
-              changed = true;
-            }
+            session.info.model = clientMessage.model;
           }
-          const now = Date.now();
-          session.info.lastActivity = now;
-          if (changed || now - session.lastPresenceBroadcastAt >= PRESENCE_HEARTBEAT_MS) {
-            session.lastPresenceBroadcastAt = now;
-            this.broadcast({ type: "presence_update", session: session.info }, currentId);
-          }
+          session.info.lastActivity = Date.now();
+          this.broadcast({ type: "presence_update", session: session.info }, currentId);
         }
         break;
       }
 
       default:
         throw new Error(`Unknown client message type: ${clientMessage.type}`);
-    }
-  }
-
-  private pruneAskEdges(now = Date.now()): void {
-    for (const [messageId, edge] of this.askEdges) {
-      if (now - edge.createdAt > this.askTimeoutMs) {
-        this.askEdges.delete(messageId);
-      }
-    }
-  }
-
-  private clearAskEdgesForSession(sessionId: string): void {
-    for (const [messageId, edge] of this.askEdges) {
-      if (edge.from === sessionId || edge.to === sessionId) {
-        this.askEdges.delete(messageId);
-      }
     }
   }
 
@@ -585,14 +311,7 @@ class IntercomBroker {
     }
 
     const lowerName = nameOrId.toLowerCase();
-    const byName = Array.from(this.sessions.values()).filter(session => session.info.name?.toLowerCase() === lowerName);
-    if (byName.length > 0) {
-      return byName;
-    }
-
-    return Array.from(this.sessions.entries())
-      .filter(([id]) => id.startsWith(nameOrId))
-      .map(([, session]) => session);
+    return Array.from(this.sessions.values()).filter(session => session.info.name?.toLowerCase() === lowerName);
   }
 
   private broadcast(msg: BrokerMessage, exclude?: string): void {
@@ -610,18 +329,12 @@ class IntercomBroker {
       session.socket.end();
     }
     this.sessions.clear();
-    this.askEdges.clear();
-    if (typeof LISTEN_TARGET === "string" && process.platform !== "win32") {
+    if (process.platform !== "win32") {
       try {
-        unlinkSync(LISTEN_TARGET);
+        unlinkSync(SOCKET_PATH);
       } catch {
         // The socket may already be gone if shutdown started after a disconnect.
       }
-    }
-    try {
-      unlinkSync(PORT_PATH);
-    } catch {
-      // The TCP endpoint file only exists when opt-in TCP transport is active.
     }
     try {
       unlinkSync(PID_PATH);
