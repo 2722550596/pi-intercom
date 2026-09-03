@@ -1,9 +1,10 @@
 ---
 name: pi-intercom
 description: |
-  Coordinate character agents and story/game processes with pi-intercom.
   Use /connect for duplex chat, send_message for push events,
-  and intercom for session discovery and one-off messages.
+  intercom for session discovery and one-off messages,
+  and read_transcript to read another session's chat history
+  (active branch only) without disturbing it.
 ---
 
 # Pi Intercom Skill (RP Fork)
@@ -14,7 +15,8 @@ communication ideal for roleplay setups.
 
 This fork does not include `contact_supervisor` (pi-subagents integration).
 It focuses on: `/connect` for natural conversation, `send_message` for
-blocking/fire-and-forget pushes.
+blocking/fire-and-forget pushes, and `read_transcript` for pull-based
+history reading.
 
 ## When to Use
 
@@ -22,6 +24,7 @@ blocking/fire-and-forget pushes.
 - **Multi-character scenes**: Several character sessions connected to one game master session
 - **Game events to character**: Game pushes a scene, dialogue trigger, or consequence via `send_message`
 - **Duplex conversation**: Both sides talk naturally without tool calls
+- **Reading another session's history**: Catch up on what a character or the GM said via `read_transcript` — no message injected, target process never interrupted
 ## Core Patterns
 
 ### Pattern 1: Character ↔ Game (Duplex)
@@ -126,6 +129,31 @@ intercom({
 })
 ```
 
+### Pattern 6: Read Another Session's History (read_transcript)
+
+Pull-based counterpart to the push tools. Reads the target session's
+**active branch** — the conversation it is actually on, never abandoned
+side branches — reconstructed from its session file on disk. The target
+process is not disturbed; nothing is injected into it.
+
+```typescript
+read_transcript({ target: "lian" })                        // last 20 entries
+read_transcript({ target: "lian", selector: "-50" })       // last 50 entries
+read_transcript({ target: "lian", selector: "20-40" })     // branch entries 20..40
+read_transcript({ target: "lian", selector: "id:9709e4bd" }) // up to that entry
+read_transcript({ target: "lian", selector: "raw:-10" })   // raw JSON entries
+read_transcript({ target: "file:~/.pi/agent/sessions/--home-u-proj--/2026-09-01T....jsonl" })
+read_transcript({ list: true })                            // who's live, for targeting
+```
+
+Selector syntax: `-N` (last N), `A-B` (range), `A-`, `id:<entry-id>`,
+optional `raw:` prefix. Output entries carry branch index, entry ID
+(reusable as `id:` anchors), timestamp, and role. Tool calls/results are
+skipped unless `includeTools: true`.
+
+Offline sessions work too: pass a bare session ID (searched under
+`~/.pi/agent/sessions/`) or `file:<path>`.
+
 ## Key Differences
 
 | Action | Behavior | Use When |
@@ -136,6 +164,11 @@ intercom({
 | `pending` | Lists unresolved inbound asks | You need to see who is waiting before replying |
 | `list` | Returns all sessions with live status | You need to discover targets or choose an idle peer |
 | `status` | Returns your connection state | Troubleshooting |
+
+Separate tool (not an intercom action): `read_transcript` — reads another
+session's active-branch history from disk without disturbing it. Use when
+you need context the peer sent to someone else, or what happened while you
+were away, without injecting any message into the target.
 
 ## Optional: Visible Peer Sessions via cmux or tmux
 
@@ -331,3 +364,21 @@ send_message({
 })
 // → Character receives it but doesn't need to respond immediately
 ```
+
+### Character Catches Up on the GM's Side (read_transcript)
+
+A character agent wants context from the game process's history — e.g. what
+the GM narrated to another character — without injecting a message into the
+game session:
+
+```typescript
+// Read the game master's recent narration (active branch only)
+read_transcript({ target: "gm", selector: "-30" })
+
+// Deep-dive from a known point: everything up to entry 9709e4bd
+read_transcript({ target: "gm", selector: "id:9709e4bd" })
+```
+
+The GM session stays idle — nothing is pushed to it. Combine with `ask`
+when you actually need a fresh answer: read the transcript first for
+context, then ask only what's missing.

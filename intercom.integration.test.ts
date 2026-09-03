@@ -2495,7 +2495,7 @@ test("supervisor tool registers only when child metadata is present", async () =
   await withChildOrchestratorEnv({}, () => {
     const harness = createExtensionHarness();
     piIntercomExtension(harness.pi as never);
-    assert.deepEqual(harness.tools.map((tool) => tool.name), ["intercom", "send_message"]);
+    assert.deepEqual(harness.tools.map((tool) => tool.name), ["intercom", "send_message", "read_transcript"]);
   });
 
   await withChildOrchestratorEnv({
@@ -2507,7 +2507,7 @@ test("supervisor tool registers only when child metadata is present", async () =
   }, () => {
     const harness = createExtensionHarness();
     piIntercomExtension(harness.pi as never);
-    assert.deepEqual(harness.tools.map((tool) => tool.name), ["contact_supervisor", "intercom", "send_message"]);
+    assert.deepEqual(harness.tools.map((tool) => tool.name), ["contact_supervisor", "intercom", "send_message", "read_transcript"]);
     const supervisorTool = harness.tools.find((tool) => tool.name === "contact_supervisor");
     assert.match(JSON.stringify(supervisorTool?.parameters), /interview_request/);
     assert.match(JSON.stringify(supervisorTool?.parameters), /questions/);
@@ -2522,7 +2522,7 @@ test("supervisor tool registers only when child metadata is present", async () =
   }, () => {
     const harness = createExtensionHarness();
     piIntercomExtension(harness.pi as never);
-    assert.deepEqual(harness.tools.map((tool) => tool.name), ["intercom", "send_message"]);
+    assert.deepEqual(harness.tools.map((tool) => tool.name), ["intercom", "send_message", "read_transcript"]);
   });
 });
 

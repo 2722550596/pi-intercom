@@ -32,6 +32,7 @@ import { join, resolve as resolvePath } from "node:path";
 import { sameCwd } from "./cwd.ts";
 import { formatContextUsage } from "./format-context.ts";
 import { openProjectPane, resolveTargetInCwd, waitForProjectSession, type ProjectPaneLaunch } from "./project-agent.ts";
+import { resolveSessionLocation, parseSelector, readTranscript, type TranscriptSelector, type SessionLocation } from "./transcript.ts";
 
 const INTERCOM_TOOL_NAME = "intercom";
 const SUBAGENT_CONTROL_INTERCOM_EVENT = "subagent:control-intercom";
@@ -3211,6 +3212,149 @@ How to use:
       }
       // Blocking result: show the result text
       return new Text(theme.fg("success", "✓ ") + theme.fg("text", firstTextContent(result)), 0, 0);
+    },
+  }));
+
+  // ── RP fork: read_transcript tool (cross-process transcript reader) ──
+  pi.registerTool(defineTool({
+    name: "read_transcript",
+    label: "Read Transcript",
+    description: `Read another pi session's chat history like reading a file.
+Reads the ACTIVE branch only (the conversation the target session is actually on),
+never abandoned side branches. The target process is not disturbed — the transcript
+is reconstructed from its session file on disk.
+
+Target: a live intercom session name or id (see action "list"), a session id on disk,
+or file:<path> to read any session file directly.
+
+Selector syntax (like reading a file, upward-truncating):
+  (omitted)          → last 20 entries
+  "-50"              → last 50 entries
+  "20-40"            → branch entries 20..40
+  "20-"              → entries from 20 to the end
+  "id:9709e4bd"      → everything up to and including that entry
+  "raw:"-prefix      → dump raw JSON entries instead of rendered text (e.g. "raw:-10")
+
+Plain user/assistant/custom messages are rendered; tool calls and tool results are
+skipped by default (pass includeTools: true to see them).`,
+    promptSnippet:
+      "Read a live pi session's recent chat history (active branch only) or any session file on disk.",
+
+    parameters: Type.Object({
+      target: Type.String({
+        description:
+          'Session to read: live session name/id (see action "list"), bare session id, or "file:/path/to/session.jsonl".',
+      }),
+      selector: Type.Optional(Type.String({
+        description: 'Which part of the active branch: "-50" (last 50), "20-40", "20-", "id:<entry-id>", optional "raw:" prefix. Default: last 20 entries.',
+      })),
+      includeTools: Type.Optional(Type.Boolean({
+        description: "Include tool calls/results in the output. Default false.",
+      })),
+      list: Type.Optional(Type.Boolean({
+        description: "List live sessions and exit (like intercom list, but for read_transcript targeting).",
+      })),
+    }),
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      void ctx;
+      if (params.list) {
+        let listClient: IntercomClient;
+        try {
+          listClient = await ensureConnected("tool");
+        } catch (error) {
+          return { content: [{ type: "text", text: `Intercom not connected: ${getErrorMessage(error)}` }], details: { error: true } };
+        }
+        const sessions = await listClient.listSessions();
+        const lines = sessions.map((s) => {
+          const self = s.id === (currentIntercomSessionId ?? currentSessionId);
+          return `${self ? "*" : " "} ${s.name || "(unnamed)"} (${s.id.slice(0, 8)}) — ${s.cwd}${self ? " [self]" : ""}`;
+        });
+        return {
+          content: [{ type: "text", text: `Live sessions (* = self):\n${lines.join("\n") || "(none)"}` }],
+          details: {},
+        };
+      }
+
+      let listClient: IntercomClient;
+      try {
+        listClient = await ensureConnected("tool");
+      } catch (error) {
+        // Broker down: still allow file:<path> reads and on-disk session ids.
+        if (!params.target.startsWith("file:")) {
+          return { content: [{ type: "text", text: `Intercom not connected: ${getErrorMessage(error)}` }], details: { error: true } };
+        }
+        listClient = null as unknown as IntercomClient;
+      }
+
+      let location: SessionLocation;
+      try {
+        location = await resolveSessionLocation(params.target, () =>
+          listClient
+            ? listClient.listSessions()
+            : Promise.resolve([] as SessionInfo[]),
+        );
+      } catch (error) {
+        return { content: [{ type: "text", text: getErrorMessage(error) }], details: { error: true } };
+      }
+
+      let selector: TranscriptSelector;
+      try {
+        selector = parseSelector(params.selector ?? "-20");
+      } catch (error) {
+        return { content: [{ type: "text", text: getErrorMessage(error) }], details: { error: true } };
+      }
+
+      try {
+        const result = readTranscript({
+          file: location.file,
+          selector,
+          includeTools: params.includeTools === true,
+          origin: location.origin,
+          live: location.live,
+          session: location.session,
+        });
+        const h = result.header;
+        const lines: string[] = [];
+        lines.push(
+          `transcript of "${h.origin}" (${h.live ? "live" : "offline"}) — ${h.file}`,
+          `branch: ${result.stats.activeBranchEntries} entries (${result.stats.offBranchEntries} on abandoned side branches, not shown)`,
+          `showing ${result.entries.length || result.raw?.length || 0} of ${result.stats.selected} selected entries:`,
+          "",
+        );
+        if (result.raw) {
+          for (const e of result.raw) {
+            lines.push(`── #${e.index} ${e.id} (${e.type}, ${e.timestamp})`);
+            lines.push(JSON.stringify(e.entry));
+          }
+        } else {
+          for (const e of result.entries) {
+            const time = e.timestamp ? new Date(e.timestamp).toLocaleString() : "";
+            lines.push(`── #${e.index} [${e.role}] ${time} (${e.id})`);
+            lines.push(e.text);
+            lines.push("");
+          }
+        }
+        return { content: [{ type: "text", text: lines.join("\n") }], details: { stats: result.stats } };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Failed to read transcript: ${getErrorMessage(error)}` }], details: { error: true } };
+      }
+    },
+    renderCall(args, theme) {
+      const target = typeof args.target === "string" ? args.target : "";
+      const selector = typeof args.selector === "string" ? args.selector : "last 20";
+      let text = theme.fg("toolTitle", theme.bold("read_transcript "));
+      text += theme.fg("accent", target);
+      text += " " + theme.fg("muted", `[${selector}]`);
+      return new Text(text, 0, 0);
+    },
+    renderResult(result, _opts, theme) {
+      const details = result.details as { error?: boolean } | undefined;
+      if (details?.error === true) {
+        return new Text(theme.fg("error", "✗ ") + theme.fg("error", firstTextContent(result)), 0, 0);
+      }
+      const count = (result.details as { stats?: { rendered?: number } } | undefined)?.stats?.rendered ?? 0;
+      return new Text(theme.fg("success", "✓ ") + theme.fg("text", `read ${count} entries`), 0, 0);
     },
   }));
 

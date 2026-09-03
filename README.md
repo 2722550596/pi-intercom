@@ -368,6 +368,33 @@ intercom({ action: "list" })
 
 **`status`** — Shows connection status, session ID, and total count of active sessions (including the current session).
 
+### read_transcript
+
+Read another pi session's chat history like reading a file. Reads the **active
+branch only** — the conversation the target session is actually on, never
+abandoned side branches. The transcript is reconstructed from the session file
+on disk; the target process is not disturbed.
+
+```typescript
+read_transcript({ target: "story" })                      // last 20 entries of "story"'s active branch
+read_transcript({ target: "story", selector: "-50" })     // last 50 entries
+read_transcript({ target: "story", selector: "20-40" })   // branch entries 20..40
+read_transcript({ target: "story", selector: "id:9709e4bd" }) // everything up to that entry
+read_transcript({ target: "story", selector: "raw:-10" }) // raw JSON dump of the last 10 entries
+read_transcript({ list: true })                           // list live sessions
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `target` | string | Live session name/ID, bare session ID (searches `~/.pi/agent/sessions/`), or `file:<path>` to read any session file directly |
+| `selector` | string | `-N` (last N), `A-B` (range), `A-`, `id:<entry-id>`, optional `raw:` prefix. Default `-20` |
+| `includeTools` | boolean | Include tool calls/results (default `false` — they are noisy) |
+| `list` | boolean | List live sessions and exit |
+
+Plain user/assistant/intercom messages are rendered with branch index, entry ID
+(usable as `id:` anchors), timestamp, and role. Entries on abandoned side
+branches are counted in the stats but never shown.
+
 ## Keyboard Shortcuts
 
 | Key | Action |
