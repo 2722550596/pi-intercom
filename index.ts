@@ -3361,7 +3361,12 @@ skipped by default (pass includeTools: true to see them).`,
   async function openIntercomOverlay(ctx: ExtensionContext): Promise<void> {
     const overlayGeneration = runtimeGeneration;
     const liveContext = getLiveContext(ctx, overlayGeneration);
-    if (!liveContext?.hasUI || (liveContext as ExtensionContext & { mode?: string }).mode !== "tui") return;
+    // Pi sets `ctx.mode` to "tui" | "rpc" | "json" | "print"; omp does not set
+    // the field at all (its `mode` is an unrelated CompactMode). Treat a
+    // missing mode as UI-capable and let `hasUI` decide, so the overlay works
+    // under both harnesses while still refusing non-TUI Pi modes.
+    const runMode = (liveContext as ExtensionContext & { mode?: string }).mode;
+    if (!liveContext?.hasUI || (runMode !== undefined && runMode !== "tui")) return;
 
     let overlayClient: IntercomClient;
     try {
