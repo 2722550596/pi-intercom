@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { test } from "node:test";
 import {
 	encodeSessionDirName,
+	encodeSessionDirNames,
 	findSessionFile,
+	getSessionRoots,
 	parseSelector,
 	readActiveBranch,
 	readTranscript,
@@ -290,4 +292,54 @@ test("resolveSessionLocation resolves live sessions by name/id/prefix and file: 
 
 	// Unknown target with a slash → file path resolution.
 	await assert.rejects(() => resolveSessionLocation("file:/no/such/file.jsonl", listSessions), /not found/);
+});
+
+test("encodeSessionDirNames emits omp home-relative and pi absolute forms", () => {
+	const home = homedir();
+	const cwd = join(home, "projects", "demo");
+	const names = encodeSessionDirNames(cwd);
+	// omp encodes relative to $HOME; pi encodes the absolute path.
+	assert.equal(names[0], "-projects-demo");
+	assert.ok(names.includes(encodeSessionDirName(cwd)), `missing absolute form: ${names.join(", ")}`);
+});
+
+test("findSessionFile resolves omp-style session dirs via the caller's own dir", () => {
+	const root = mkdtempSync(join(tmpdir(), "omp-sessions-"));
+	const cwd = join(homedir(), "projects", "demo");
+	const sessionDir = join(root, "-projects-demo");
+	mkdirSync(sessionDir, { recursive: true });
+	const file = join(sessionDir, "2026-01-01T00-00-00.000Z_id-omp.jsonl");
+	writeFileSync(file, JSON.stringify({ type: "session", id: "id-omp", timestamp: "t", cwd }) + "\n");
+
+	// The caller's session dir pins the omp root even though getAgentDirPath()
+	// would only ever hand back ~/.pi/agent.
+	assert.equal(findSessionFile("id-omp", cwd, sessionDir), file);
+	assert.equal(findSessionFile("id-omp", undefined, sessionDir), file);
+	// Without the pin, the cwd-derived dir under the omp root is still found
+	// because the default ~/.omp root is searched.
+	assert.ok(getSessionRoots(sessionDir)[0] === resolve(root));
+});
+
+test("resolveSessionLocation resolves omp peers with a pinned session dir", async () => {
+	const root = mkdtempSync(join(tmpdir(), "omp-sessions-"));
+	const cwd = join(homedir(), "projects", "demo");
+	const sessionDir = join(root, "-projects-demo");
+	mkdirSync(sessionDir, { recursive: true });
+	const file = join(sessionDir, "2026-01-01T00-00-00.000Z_cccccccc-4444.jsonl");
+	writeFileSync(file, JSON.stringify({ type: "session", id: "cccccccc-4444", timestamp: "t", cwd }) + "\n");
+
+	const sessions: SessionInfo[] = [
+		{ id: "cccccccc-4444", name: "peer", cwd, model: "m", pid: 1, startedAt: 1, lastActivity: 1 },
+	];
+	const located = await resolveSessionLocation("peer", () => Promise.resolve(sessions), { sessionDir });
+	assert.equal(located.file, file);
+	assert.equal(located.live, true);
+
+	// The failure message names the roots it searched, so a miss is diagnosable.
+	await assert.rejects(
+		() => resolveSessionLocation("dddddddd-5555", () => Promise.resolve([
+			{ id: "dddddddd-5555", name: "ghost", cwd, model: "m", pid: 2, startedAt: 1, lastActivity: 1 },
+		]), { sessionDir }),
+		(err: Error) => err.message.includes("could not be located") && err.message.includes(resolve(root)),
+	);
 });

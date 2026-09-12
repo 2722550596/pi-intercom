@@ -386,7 +386,7 @@ read_transcript({ list: true })                           // list live sessions
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `target` | string | Live session name/ID, bare session ID (searches `~/.pi/agent/sessions/`), or `file:<path>` to read any session file directly |
+| `target` | string | Live session name/ID, bare session ID (searched across the Pi and OMP sessions roots), or `file:<path>` to read any session file directly |
 | `selector` | string | `-N` (last N), `A-B` (range), `A-`, `id:<entry-id>`, optional `raw:` prefix. Default `-20` |
 | `includeTools` | boolean | Include tool calls/results (default `false` — they are noisy) |
 | `list` | boolean | List live sessions and exit |
@@ -394,6 +394,12 @@ read_transcript({ list: true })                           // list live sessions
 Plain user/assistant/intercom messages are rendered with branch index, entry ID
 (usable as `id:` anchors), timestamp, and role. Entries on abandoned side
 branches are counted in the stats but never shown.
+
+Session files are located by searching both harness roots — Pi's
+`~/.pi/agent/sessions/` and OMP's `~/.omp/agent/sessions/` — plus the calling
+session's own session directory, so peers in either runtime resolve. The two
+harnesses also key per-cwd directories differently (Pi uses the absolute path,
+OMP uses the path relative to `$HOME`); both encodings are tried.
 
 ## Keyboard Shortcuts
 

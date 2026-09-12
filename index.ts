@@ -26,6 +26,7 @@ import {
   type IntercomOutboxResultStatus,
   type IntercomOutboxResultV1,
 } from "./extension-api.ts";
+import { getIntercomDirPath } from "./broker/paths.ts";
 import { ReplyTracker } from "./reply-tracker.ts";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve as resolvePath } from "node:path";
@@ -1408,8 +1409,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     // RP fork: background → write to JSON queue, do not trigger turn
     if (receivedMessage.background) {
       try {
-        const homeDir = process.env.HOME || process.env.USERPROFILE || "/tmp";
-        const queueDir = join(homeDir, ".pi", "agent", "intercom");
+        // Same runtime dir the broker uses, so pi and omp share one queue.
+        const queueDir = getIntercomDirPath();
         mkdirSync(queueDir, { recursive: true });
         const queueFile = join(queueDir, "background-queue.json");
         let queue: Array<{ from: { id: string; name: string }; text: string; timestamp: number }> = [];
@@ -3257,7 +3258,10 @@ skipped by default (pass includeTools: true to see them).`,
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      void ctx;
+      // Pin the caller's own sessions root: omp stores sessions under
+      // ~/.omp/agent/sessions and does not export PI_CODING_AGENT_DIR, so the
+      // env-var default alone would never find peers in this harness.
+      const sessionDir = ctx.sessionManager.getSessionDir();
       if (params.list) {
         let listClient: IntercomClient;
         try {
@@ -3289,10 +3293,10 @@ skipped by default (pass includeTools: true to see them).`,
 
       let location: SessionLocation;
       try {
-        location = await resolveSessionLocation(params.target, () =>
-          listClient
-            ? listClient.listSessions()
-            : Promise.resolve([] as SessionInfo[]),
+        location = await resolveSessionLocation(
+          params.target,
+          () => (listClient ? listClient.listSessions() : Promise.resolve([] as SessionInfo[])),
+          { sessionDir },
         );
       } catch (error) {
         return { content: [{ type: "text", text: getErrorMessage(error) }], details: { error: true } };

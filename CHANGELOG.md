@@ -9,6 +9,7 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 
 ### Fixed
 - Write the hidden Windows broker launcher as UTF-16LE with a BOM and explicitly select the VBScript engine so startup works with non-ASCII paths and WSH configurations that cannot infer `.vbs`. Thanks to [@maelo1028](https://github.com/maelo1028) for issue #121 and [@Agustin-Prieto](https://github.com/Agustin-Prieto) for issue #123.
+- `read_transcript` now locates session files in either harness: it searches both Pi's `~/.pi/agent/sessions/` and OMP's `~/.omp/agent/sessions/` (including named profiles), resolves both per-cwd directory encodings (Pi's absolute path and OMP's `$HOME`-relative path), and pins the calling session's own session directory so OMP peers resolve even though OMP never exports `PI_CODING_AGENT_DIR`. The "could not be located" error now names every root it searched.
 
 ## [0.12.1] - 2026-08-29
 

@@ -143,6 +143,7 @@ read_transcript({ target: "lian", selector: "20-40" })     // branch entries 20.
 read_transcript({ target: "lian", selector: "id:9709e4bd" }) // up to that entry
 read_transcript({ target: "lian", selector: "raw:-10" })   // raw JSON entries
 read_transcript({ target: "file:~/.pi/agent/sessions/--home-u-proj--/2026-09-01T....jsonl" })
+read_transcript({ target: "file:~/.omp/agent/sessions/-projects-proj/2026-09-01T....jsonl" })
 read_transcript({ list: true })                            // who's live, for targeting
 ```
 
@@ -151,8 +152,11 @@ optional `raw:` prefix. Output entries carry branch index, entry ID
 (reusable as `id:` anchors), timestamp, and role. Tool calls/results are
 skipped unless `includeTools: true`.
 
-Offline sessions work too: pass a bare session ID (searched under
-`~/.pi/agent/sessions/`) or `file:<path>`.
+Offline sessions work too: pass a bare session ID (searched under both Pi's
+`~/.pi/agent/sessions/` and OMP's `~/.omp/agent/sessions/`, including named
+profiles) or `file:<path>`. Live peers resolve through the calling session's own
+session directory, which pins the right root even when the harness does not
+export `PI_CODING_AGENT_DIR` (OMP never does).
 
 ## Key Differences
 

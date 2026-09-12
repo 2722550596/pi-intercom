@@ -13,8 +13,8 @@
  * (concurrently-written) lines are skipped, and the file is never mutated.
  */
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { homedir } from "node:os";
-import { basename, isAbsolute, join, resolve } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { getAgentDirPath } from "./broker/paths.ts";
 import type { SessionInfo } from "./types.ts";
 
@@ -67,36 +67,107 @@ export interface SessionLocation {
 	/** Live peer metadata, when resolved via the intercom session list. */
 	session?: SessionInfo;
 }
-
 // ── File resolution ──────────────────────────────────────────────────────────
 
-/** Encode a cwd into a session directory name (mirrors SessionManager). */
+/** Encode a cwd into a session directory name (mirrors Pi's SessionManager). */
 export function encodeSessionDirName(cwd: string): string {
 	const resolved = resolve(cwd);
 	return `--${resolved.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
 }
 
 /**
+ * Candidate session directory names for a cwd, in preference order.
+ *
+ * Pi keys session dirs by absolute path (`--home-u-proj--`); omp keys them by
+ * path relative to $HOME (`-projects-proj`), falling back to $TMPDIR-relative
+ * and finally the absolute form. Emit every form so either harness resolves.
+ */
+export function encodeSessionDirNames(cwd: string): string[] {
+	const resolved = resolve(cwd);
+	const names: string[] = [];
+
+	const relativeName = (prefix: string, value: string): string => {
+		const encoded = value.replace(/[/\\:]/g, "-");
+		if (!encoded) return prefix;
+		return prefix.endsWith("-") ? `${prefix}${encoded}` : `${prefix}-${encoded}`;
+	};
+	const inside = (base: string): string | undefined => {
+		const rel = relative(resolve(base), resolved);
+		if (rel === "") return "";
+		return rel.startsWith("..") || isAbsolute(rel) ? undefined : rel;
+	};
+
+	const fromHome = inside(homedir());
+	if (fromHome !== undefined) names.push(relativeName("-", fromHome));
+	const fromTmp = inside(tmpdir());
+	if (fromTmp !== undefined) names.push(relativeName("-tmp", fromTmp));
+	names.push(encodeSessionDirName(resolved));
+
+	return [...new Set(names)];
+}
+
+/**
+ * Session storage roots to search, most-preferred first.
+ *
+ * Pi stores sessions under `~/.pi/agent/sessions`; omp stores them under
+ * `~/.omp/agent/sessions` and — critically — does not export
+ * `PI_CODING_AGENT_DIR`, so `getAgentDirPath()` alone can never see them. The
+ * caller's own session directory (when known) comes first: its parent is the
+ * live sessions root, which also covers omp profiles and custom `--session`
+ * directories. The two harness defaults follow as fallbacks so offline session
+ * ids resolve from either side.
+ */
+export function getSessionRoots(preferredSessionDir?: string): string[] {
+	const roots: string[] = [];
+	const add = (dir: string | undefined): void => {
+		if (!dir) return;
+		const resolved = resolve(dir);
+		if (!roots.includes(resolved)) roots.push(resolved);
+	};
+
+	add(preferredSessionDir ? dirname(preferredSessionDir) : undefined);
+
+	// Pi root: honors PI_CODING_AGENT_DIR, else ~/.pi/agent.
+	add(join(getAgentDirPath(), "sessions"));
+
+	// omp root. `PI_CONFIG_DIR` is normally relative to $HOME (`.omp`), and a
+	// named profile nests one level deeper. `PI_PROFILE`/`OMP_PROFILE` selects it.
+	const ompConfig = (process.env.PI_CONFIG_DIR?.trim() || ".omp");
+	const ompBase = isAbsolute(ompConfig) ? ompConfig : join(homedir(), ompConfig);
+	const profile = process.env.OMP_PROFILE?.trim() || process.env.PI_PROFILE?.trim();
+	if (profile) add(join(ompBase, "profiles", profile, "agent", "sessions"));
+	add(join(ompBase, "agent", "sessions"));
+
+	return roots;
+}
+
+/**
  * Find the session file for a session id, scoped to a cwd when available.
  * Session ids are UUIDv7, so newest file wins when duplicates exist.
+ *
+ * `sessionDir` is the calling session's own session directory (from
+ * `ctx.sessionManager.getSessionDir()`), which pins the correct harness root.
  */
-export function findSessionFile(sessionId: string, cwd?: string): string | null {
-	const agentDir = getAgentDirPath();
-	const sessionsRoot = join(agentDir, "sessions");
+export function findSessionFile(sessionId: string, cwd?: string, sessionDir?: string): string | null {
+	const roots = getSessionRoots(sessionDir);
 	const candidates: string[] = [];
 
 	if (cwd) {
-		candidates.push(join(sessionsRoot, encodeSessionDirName(cwd)));
+		for (const root of roots) {
+			for (const name of encodeSessionDirNames(cwd)) {
+				candidates.push(join(root, name));
+			}
+		}
 	}
 	// Fall back to scanning all session dirs: custom --session paths, unusual
 	// cwds, or files written before the cwd was known.
-	const dirs = candidates.length > 0 ? [...candidates, sessionsRoot] : [sessionsRoot];
+	const dirs = [...candidates, ...roots];
 	const seen = new Set<string>();
 	let best: { path: string; mtime: number } | null = null;
 	for (const dir of dirs) {
 		if (seen.has(dir) || !existsSync(dir)) continue;
 		seen.add(dir);
-		if (dir === sessionsRoot) {
+		if (roots.includes(dir)) {
 			// Flat fallback: scan every per-cwd directory one level deep.
 			for (const name of readdirSync(dir)) {
 				const sub = join(dir, name);
@@ -140,11 +211,19 @@ function collectSessionFileMatches(
 	}
 }
 
+/** Options for {@link resolveSessionLocation}. */
+export interface ResolveSessionOptions {
+	/** Calling session's own session directory (`ctx.sessionManager.getSessionDir()`). */
+	sessionDir?: string;
+}
+
 /** Resolve a target session to a readable file, via live sessions or a raw path. */
 export async function resolveSessionLocation(
 	target: string,
 	listSessions: () => Promise<SessionInfo[]>,
+	options: ResolveSessionOptions = {},
 ): Promise<SessionLocation> {
+	const { sessionDir } = options;
 	if (target.startsWith("file:")) {
 		const raw = target.slice("file:".length);
 		const file = resolve(raw.startsWith("~") ? raw.replace(/^~(?=\/|$)/, homedir()) : raw);
@@ -175,26 +254,26 @@ export async function resolveSessionLocation(
 	}
 
 	if (session) {
-		const file = findSessionFile(session.id, session.cwd);
+		const file = findSessionFile(session.id, session.cwd, sessionDir);
 		if (file) {
 			return { file, sessionId: session.id, origin: session.name || session.id.slice(0, 8), live: true, session };
 		}
 		// Live session whose file can't be located (custom session dir, never
 		// persisted, etc.) — fall through to a global search before giving up.
-		const fallback = findSessionFile(session.id);
+		const fallback = findSessionFile(session.id, undefined, sessionDir);
 		if (fallback) {
 			return { file: fallback, sessionId: session.id, origin: session.name || session.id.slice(0, 8), live: true, session };
 		}
 		throw new Error(
-			`Session "${session.name || session.id.slice(0, 8)}" is live but its session file could not be located on disk.`,
+			`Session "${session.name || session.id.slice(0, 8)}" is live but its session file could not be located on disk (searched ${getSessionRoots(sessionDir).join(", ")}).`,
 		);
 	}
 
 	// Not a live session: treat the target as a session id or file path.
 	if (target.includes("/") || target.includes("~")) {
-		return resolveSessionLocation(`file:${target}`, listSessions);
+		return resolveSessionLocation(`file:${target}`, listSessions, options);
 	}
-	const file = findSessionFile(target);
+	const file = findSessionFile(target, undefined, sessionDir);
 	if (file) {
 		return { file, origin: target.slice(0, 8), live: false };
 	}
