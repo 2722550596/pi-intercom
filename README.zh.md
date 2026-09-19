@@ -84,25 +84,26 @@ pi install npm:pi-intercom
 
 如果你不想建立双工通道，也可以用 tool 发单次消息：
 
-### 通话模式（阻塞等待回复）
-
-```typescript
-send_message({
-  to: "story",
-  message: "我小心翼翼地推开那扇吱呀作响的门……"
-})
-// → 阻塞，直到游戏 session 回复门后面是什么
-```
-
-### 留言模式（发完就跑）
+### 留言模式（默认，发完就跑）
 
 ```typescript
 send_message({
   to: "lian",
-  message: "走廊尽头传来脚步声。",
-  blocking: false
+  message: "走廊尽头传来脚步声。"
 })
 // → 立即返回，消息以真实用户输入送达角色 session
+// → 默认不会把对方回合的输出转发回来
+```
+
+### 通话模式（阻塞等待回复，需显式 blocking: true）
+
+```typescript
+send_message({
+  to: "story",
+  message: "我小心翼翼地推开那扇吱呀作响的门……",
+  blocking: true
+})
+// → 阻塞，直到游戏 session 回复门后面是什么
 ```
 
 ---

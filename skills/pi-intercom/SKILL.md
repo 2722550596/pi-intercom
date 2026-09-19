@@ -49,23 +49,24 @@ Now everything flows automatically:
 - Game's narration lands as user input in the character session
 - No tools needed — just talk
 
-**Duplex with a one-off message (blocking):**
+**Blocking call (通话模式):**
 ```typescript
 send_message({
   to: "story",
-  message: "I draw my sword and step forward."
+  message: "I draw my sword and step forward.",
+  blocking: true
 })
 // → Blocks until the game session replies
 ```
 
-**Fire-and-forget (non-blocking):**
+**Fire-and-forget (default):**
 ```typescript
 send_message({
   to: "lian",
-  message: "A cold wind blows through the hall.",
-  blocking: false
+  message: "A cold wind blows through the hall."
 })
-// → Returns immediately, character receives it as a new user message
+// → Returns immediately, character receives it as a new user message;
+//   their turn output is not forwarded back automatically
 ```
 
 ### Pattern 2: Quick Status Check

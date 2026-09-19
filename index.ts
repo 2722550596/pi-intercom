@@ -645,14 +645,16 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
 
   /** Global hook for two-pass renderers to deliver fsn-prose content (e.g., fate-sandbox). */
   function onProseReady(text: string): void {
-    // Handle pendingUserMessageResults (existing send_message reply tracking)
+    // Handle pendingUserMessageResults (existing send_message reply tracking).
+    // Fire-and-forget (expectsReply: false) entries are consumed silently —
+    // the prose output must NOT be forwarded back to the sender.
     if (pendingUserMessageResults.length > 0) {
       const pending = pendingUserMessageResults.shift()!;
       const activeClient = client;
-      if (activeClient?.isConnected()) {
+      if (pending.expectsReply && activeClient?.isConnected()) {
         activeClient.send(pending.from.id, {
           text,
-          replyTo: pending.expectsReply ? pending.messageId : undefined,
+          replyTo: pending.messageId,
         }).catch(() => {
           // Best-effort result delivery
         });
@@ -2036,18 +2038,22 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       }
     }
 
-    // Send results back for completed deliverAsUser messages
+    // Send results back for completed deliverAsUser messages that expect a reply.
+    // Fire-and-forget send_message (expectsReply: false) stays silent: the sender's
+    // session flow must NOT receive this turn's output automatically.
     if (pendingUserMessageResults.length > 0) {
       const pending = pendingUserMessageResults.shift()!;
       // Skip reply if the target is also a cast listener — the cast-forward above
       // already delivers the same output, and the duplicate message would bypass
       // the background queue (arriving as a plain notification instead).
-      if (lastAssistantText && !listeners.has(pending.from.id)) {
+      if (!pending.expectsReply) {
+        // Fire-and-forget: no automatic result forwarding.
+      } else if (lastAssistantText && !listeners.has(pending.from.id)) {
         const activeClient = client;
         if (activeClient?.isConnected()) {
           activeClient.send(pending.from.id, {
             text: lastAssistantText,
-            replyTo: pending.expectsReply ? pending.messageId : undefined,
+            replyTo: pending.messageId,
           }).catch(() => {
             // Best-effort result delivery
           });
@@ -3037,9 +3043,10 @@ and handle it just like a real user message — no notification, no "from interc
 
 How to use:
   send_message({ to: "name", message: "..." })
-    → "Call Mode": send and wait for their full reply
-  send_message({ to: "name", message: "...", blocking: false })
-    → "Leave-a-Message": fire and forget, reply arrives later`,
+    → "Leave-a-Message" (default): fire and forget. The receiver's output is
+      NOT forwarded back automatically.
+  send_message({ to: "name", message: "...", blocking: true })
+    → "Call Mode": send and wait for their full reply`,
     promptSnippet:
       "Send a message to someone online. Good for gaming, RP, and backstage coordination.",
 
@@ -3055,7 +3062,7 @@ How to use:
         description: "What you want to say",
       }),
       blocking: Type.Optional(Type.Boolean({
-        description: "Whether to wait for their full reply. Default true (wait). Set to false to fire and forget.",
+        description: "Whether to wait for their full reply. Default false (fire and forget, no result forwarding). Set to true to wait.",
       })),
     }),
 
@@ -3074,7 +3081,7 @@ How to use:
       syncPresenceIdentity(ctx.sessionManager.getSessionId());
 
       const { to, message, blocking } = params;
-      const blockingMode = blocking !== false; // default true
+      const blockingMode = blocking === true; // default false: fire and forget, no result forwarding
 
       if (!to || !message) {
         return {
@@ -3170,7 +3177,7 @@ How to use:
           pi.appendEntry("send_message_sent", { to, message, blocking: false, timestamp: Date.now() });
 
           return {
-            content: [{ type: "text", text: `Message sent to ${to}. Result will arrive when the remote agent finishes processing.` }],
+            content: [{ type: "text", text: `Message sent to ${to}. Fire-and-forget: the receiver's output will not be forwarded back.` }],
             isError: false,
             details: { messageId, delivered: true, blocking: false },
           };

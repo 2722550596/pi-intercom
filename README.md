@@ -309,20 +309,21 @@ If you prefer one-off messages without establishing a duplex channel, use the to
 ```typescript
 send_message({
   to: "story",
-  message: "I cautiously open the creaky door..."
+  message: "I cautiously open the creaky door...",
+  blocking: true
 })
 // → Blocks until the game session replies with what's behind it
 ```
 
-**Fire-and-forget (留言模式):**
+**Fire-and-forget (留言模式, default):**
 
 ```typescript
 send_message({
   to: "lian",
-  message: "You hear footsteps approaching from the corridor.",
-  blocking: false
+  message: "You hear footsteps approaching from the corridor."
 })
-// → Returns immediately; the message arrives as a new user message to the character
+// → Returns immediately; the message arrives as a new user message to the character.
+// → The character's turn output is NOT forwarded back automatically.
 ```
 
 ### Receiving Messages
